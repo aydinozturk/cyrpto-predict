@@ -3,6 +3,10 @@
 Every value at timestamp ``t`` is computed from bars at or before ``t``.  The
 module intentionally leaves warm-up rows as ``NaN``; dataset construction is
 responsible for dropping rows that are not ready for model input.
+
+Missing candles (exchange outages) split the series into contiguous segments.
+Indicators are computed per segment, so no window or EMA state spans a gap and
+the rows right after a gap get the same warm-up ``NaN`` as the series start.
 """
 
 from __future__ import annotations
@@ -133,6 +137,46 @@ def _require_positive_int(name: str, value: Any) -> None:
         raise ValueError(f"{name} must contain/be a positive integer, got {value!r}")
 
 
+BarLike = pd.Timedelta | str | None
+
+
+def infer_bar(index: pd.DatetimeIndex) -> pd.Timedelta | None:
+    """Bar length of ``index``: its most common step (the smallest one on ties).
+
+    Returns ``None`` when there are fewer than two timestamps.
+    """
+    if len(index) < 2:
+        return None
+    counts = pd.Series(index[1:] - index[:-1]).value_counts()
+    return counts[counts == counts.max()].index.min()
+
+
+def _resolve_bar(index: pd.DatetimeIndex, bar: BarLike) -> pd.Timedelta | None:
+    if bar is None:
+        return infer_bar(index)
+    try:
+        value = pd.Timedelta(bar)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"bar must be a positive Timedelta, got {bar!r}") from exc
+    if pd.isna(value) or value <= pd.Timedelta(0):
+        raise ValueError(f"bar must be a positive Timedelta, got {bar!r}")
+    return value
+
+
+def segment_ids(index: pd.DatetimeIndex, bar: BarLike = None) -> np.ndarray:
+    """Number the contiguous runs of ``index``: a step longer than ``bar`` starts a new one.
+
+    ``bar`` defaults to :func:`infer_bar`. Gap-free data is a single segment (all 0).
+    """
+    if not isinstance(index, pd.DatetimeIndex):
+        raise ValueError(f"index must be a DatetimeIndex, got {type(index).__name__}")
+    step = _resolve_bar(index, bar)
+    if step is None:
+        return np.zeros(len(index), dtype="int64")
+    breaks = np.asarray(index[1:] - index[:-1] > step)
+    return np.concatenate([[0], np.cumsum(breaks)]).astype("int64")
+
+
 def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator / denominator.mask(denominator == 0.0)
 
@@ -153,21 +197,32 @@ def _rsi(close: pd.Series, window: int) -> pd.Series:
 def build_features(
     df: pd.DataFrame,
     config: FeatureConfigLike = None,
+    bar: BarLike = None,
 ) -> pd.DataFrame:
     """Build causal model features with the same index as ``df``.
 
-    Warm-up rows contain ``NaN`` by design.  Use
-    :func:`cryptopredict.features.make_dataset` to align and remove incomplete
-    rows for training, or :func:`cryptopredict.features.latest_features` for a
-    live prediction row.
+    Warm-up rows contain ``NaN`` by design, at the start of the series and after
+    every candle gap (a step longer than ``bar``, inferred from the index by
+    default).  Use :func:`cryptopredict.features.make_dataset` to align and
+    remove incomplete rows for training, or
+    :func:`cryptopredict.features.latest_features` for a live prediction row.
     """
     cfg = resolve_config(config)
     ohlcv = validate_ohlcv(df)
-    close = ohlcv["close"]
-    volume = ohlcv["volume"]
-    if (close <= 0.0).any():
+    if (ohlcv["close"] <= 0.0).any():
         raise ValueError("close prices must be strictly positive")
 
+    segments = segment_ids(ohlcv.index, bar)
+    if len(segments) == 0 or segments[-1] == 0:
+        return _segment_features(ohlcv, cfg)
+    parts = [_segment_features(part, cfg) for _, part in ohlcv.groupby(segments, sort=False)]
+    return pd.concat(parts)
+
+
+def _segment_features(ohlcv: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
+    """Features of a validated, gap-free OHLCV frame."""
+    close = ohlcv["close"]
+    volume = ohlcv["volume"]
     features = pd.DataFrame(index=ohlcv.index)
     log_close = np.log(close)
     for lag in cfg.return_lags:
@@ -213,9 +268,10 @@ def build_features(
     upper = middle + cfg.bollinger_std * deviation
     lower = middle - cfg.bollinger_std * deviation
     band_range = upper - lower
+    # A flat window has a zero-width band: the close sits in its middle.
     features[f"bollinger_pct_b_{cfg.bollinger_window}"] = _safe_ratio(
         close - lower, band_range
-    )
+    ).mask(band_range == 0.0, 0.5)
     features[f"bollinger_width_{cfg.bollinger_window}"] = _safe_ratio(
         band_range, middle
     )
@@ -230,9 +286,10 @@ def build_features(
     volume_std = volume.rolling(
         window=cfg.volume_zscore_window, min_periods=cfg.volume_zscore_window
     ).std(ddof=0)
+    # Constant volume deviates by zero standard deviations.
     features[f"volume_zscore_{cfg.volume_zscore_window}"] = _safe_ratio(
         volume - volume_mean, volume_std
-    )
+    ).mask(volume_std == 0.0, 0.0)
 
     if cfg.add_time_features:
         hour = ohlcv.index.hour.to_numpy(dtype="float64")

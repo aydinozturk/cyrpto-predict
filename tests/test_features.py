@@ -7,10 +7,27 @@ from cryptopredict.features import (
     FeatureConfig,
     build_features,
     forward_log_return,
+    infer_bar,
     latest_features,
     make_dataset,
     make_target,
+    segment_ids,
 )
+from cryptopredict.features.indicators import _segment_features
+
+HOUR = pd.Timedelta(hours=1)
+GAP_AT = 300  # position of the candle removed from the fixture
+
+
+def _with_gap(ohlcv, position=GAP_AT):
+    """The fixture with one candle missing, like a Binance maintenance outage."""
+    return ohlcv.drop(ohlcv.index[position])
+
+
+def _warmup_rows(ohlcv, config=None):
+    """Leading rows a gap-free series needs before its features are complete."""
+    complete = build_features(ohlcv, config).notna().all(axis=1).to_numpy()
+    return int(np.argmax(complete))
 
 
 def test_build_features_has_expected_shape_and_columns(ohlcv):
@@ -116,3 +133,99 @@ def test_invalid_feature_config_is_rejected():
         FeatureConfig(return_lags=(2,))
     with pytest.raises(ValueError, match="unknown"):
         FeatureConfig.from_dict({"future_window": 5})
+
+
+def test_infer_bar_and_segment_ids(ohlcv):
+    assert infer_bar(ohlcv.index) == HOUR
+    assert infer_bar(ohlcv.index[:1]) is None
+    assert (segment_ids(ohlcv.index) == 0).all()
+
+    gapped = _with_gap(ohlcv)
+    segments = segment_ids(gapped.index)
+    assert infer_bar(gapped.index) == HOUR
+    assert (segments[:GAP_AT] == 0).all() and (segments[GAP_AT:] == 1).all()
+    # An explicit bar longer than the outage treats the series as contiguous.
+    assert (segment_ids(gapped.index, bar="2h") == 0).all()
+
+    with pytest.raises(ValueError, match="bar"):
+        segment_ids(ohlcv.index, bar=pd.Timedelta(0))
+    with pytest.raises(ValueError, match="bar"):
+        segment_ids(ohlcv.index, bar="soon")
+
+
+@pytest.mark.parametrize("horizon", [1, 3])
+def test_target_does_not_span_gap(ohlcv, horizon):
+    gapped = _with_gap(ohlcv)
+    target = make_target(gapped, horizon=horizon)
+    close = gapped["close"]
+    naive = np.log(close.shift(-horizon) / close)
+
+    spanning = np.arange(GAP_AT - horizon, GAP_AT)
+    assert target.iloc[spanning].isna().all()
+    assert naive.iloc[spanning].notna().all()  # the bug: these were (h+1)-hour returns
+    keep = np.setdiff1d(np.arange(len(gapped) - horizon), spanning)
+    np.testing.assert_array_equal(target.iloc[keep].to_numpy(), naive.iloc[keep].to_numpy())
+
+    X, y = make_dataset(gapped, horizon=horizon)
+    assert not X.index.isin(gapped.index[spanning]).any()
+    assert ((gapped.index.to_series().shift(-horizon) - gapped.index.to_series())
+            .reindex(y.index) == horizon * HOUR).all()
+
+
+def test_features_after_gap_restart_their_warmup(ohlcv):
+    gapped = _with_gap(ohlcv)
+    before, after = gapped.iloc[:GAP_AT], gapped.iloc[GAP_AT:]
+    features = build_features(gapped)
+
+    # Each side of the gap is computed as if it were its own series.
+    pd.testing.assert_frame_equal(features.iloc[:GAP_AT], build_features(before))
+    pd.testing.assert_frame_equal(features.iloc[GAP_AT:], build_features(after))
+
+    warmup = _warmup_rows(ohlcv)
+    assert warmup > 24
+    X, _ = make_dataset(gapped, horizon=1)
+    assert not X.index.isin(after.index[:warmup]).any()
+    assert after.index[warmup] in X.index
+
+    # Every kept log_ret_1 is a genuine one-bar return.
+    previous = gapped.index.to_series().shift(1).reindex(X.index)
+    assert ((X.index.to_series() - previous) == HOUR).all()
+
+
+def test_gap_free_features_match_single_segment(ohlcv):
+    cfg = FeatureConfig(add_time_features=True)
+    pd.testing.assert_frame_equal(build_features(ohlcv, cfg), _segment_features(ohlcv, cfg))
+    pd.testing.assert_frame_equal(build_features(ohlcv, cfg, bar="1h"), build_features(ohlcv, cfg))
+
+
+def test_latest_features_rejects_bar_right_after_gap(ohlcv):
+    warmup = _warmup_rows(ohlcv)
+    near_end = _with_gap(ohlcv, position=len(ohlcv) - 5)
+    with pytest.raises(ValueError, match="after a candle gap"):
+        latest_features(near_end)
+
+    far_back = _with_gap(ohlcv, position=len(ohlcv) - warmup - 5)
+    latest = latest_features(far_back)
+    assert latest.index[0] == far_back.index[-1]
+    assert not latest.isna().any().any()
+
+
+def test_flat_market_gets_neutral_features():
+    index = pd.date_range("2026-01-01", periods=120, freq="1h", tz="UTC", name="open_time")
+    flat = pd.DataFrame(
+        {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 5.0},
+        index=index,
+    )
+    X, y = make_dataset(flat, horizon=1)
+
+    assert len(X) > 0
+    assert (X["bollinger_pct_b_20"] == 0.5).all()
+    assert (X["bollinger_width_20"] == 0.0).all()
+    assert (X["volume_zscore_24"] == 0.0).all()
+    assert (X["rsi_14"] == 50.0).all()
+    assert (y == 0.0).all()
+
+
+def test_forward_log_return_bar_needs_datetime_index():
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        forward_log_return(pd.Series([1.0, 2.0, 3.0]), horizon=1, bar="1h")
