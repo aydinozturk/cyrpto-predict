@@ -124,10 +124,16 @@
     if (kind === "int") return fmtNum(v, 0);
     if (typeof v === "boolean") return v ? "evet" : "hayır";
     if (typeof v === "string") return v;
-    return fmtNum(v, 6);
+    if (!isNum(v)) return "—";
+    return Math.abs(v) >= 1 ? fmtNum(v, 3) : v.toLocaleString(LOCALE, { maximumSignificantDigits: 4 });
   }
 
   const metricLabel = (key) => METRICS[key]?.[0] ?? key;
+
+  // Job ids may be long hex strings; show a short prefix like git does.
+  const shortId = (id) => String(id).slice(0, 8);
+
+  const truncate = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
   function fmtParams(params) {
     if (!params || typeof params !== "object") return "";
@@ -285,7 +291,7 @@
 
   async function submitJob(path, body, label) {
     const res = await api(path, { method: "POST", body });
-    toast(`${label} işi #${res.job_id} kuyruğa alındı.`);
+    toast(`${label} işi #${shortId(res.job_id)} kuyruğa alındı.`);
     await loadJobs();
     return res.job_id;
   }
@@ -309,7 +315,7 @@
         state.watchBacktest = id;
         const card = $("#backtest-result");
         card.hidden = false;
-        card.replaceChildren(el("h2", {}, `Backtest işi #${id}`), el("p", { class: "hint" }, "İş çalışıyor; bitince sonuç burada görünecek."));
+        card.replaceChildren(el("h2", {}, `Backtest işi #${shortId(id)}`), el("p", { class: "hint" }, "İş çalışıyor; bitince sonuç burada görünecek."));
       }, ev.submitter);
     });
 
@@ -423,7 +429,7 @@
     const n = state.bars.length;
     ctx.textBaseline = "top";
     ctx.textAlign = "center";
-    const ticks = Math.min(5, n);
+    const ticks = Math.max(1, Math.min(5, n, Math.floor((g.w - g.pad.left - g.pad.right) / 110)));
     for (let k = 0; k < ticks; k++) {
       const i = ticks === 1 ? 0 : Math.round((k * (n - 1)) / (ticks - 1));
       const xx = g.x(i);
@@ -560,7 +566,7 @@
   function renderBacktest(job) {
     const card = $("#backtest-result");
     card.hidden = false;
-    const title = el("div", { class: "card-head" }, el("h2", {}, `Backtest işi #${job.id}`), el("span", { class: "hint" }, fmtParams(job.params)));
+    const title = el("div", { class: "card-head" }, el("h2", {}, `Backtest işi #${shortId(job.id)}`), el("span", { class: "hint" }, fmtParams(job.params)));
     if (job.status === "failed") card.replaceChildren(title, el("p", { class: "error-text" }, job.error || "İş başarısız oldu."));
     else card.replaceChildren(title, backtestView(job.result),
       el("p", { class: "hint" }, "Getiri, düşüş, maliyet ve yön isabeti yüzde olarak gösterilir; al-tut = buy & hold."));
@@ -571,7 +577,7 @@
   const isActive = (job) => job.status === "queued" || job.status === "running";
 
   function jobSummary(job) {
-    if (job.status === "failed") return el("span", { class: "error-text" }, job.error || "hata");
+    if (job.status === "failed") return el("span", { class: "error-text", title: job.error || "" }, truncate(job.error || "hata", 160));
     if (job.status !== "done" || !job.result) return "";
     const r = job.result;
     if (job.kind === "fetch") return `${fmtNum(r.rows, 0)} satır · ${fmtDate(r.start, false)} – ${fmtDate(r.end, false)}`;
@@ -591,7 +597,7 @@
       class: `clickable${state.selectedJob === job.id ? " selected" : ""}`,
       onclick: () => { state.selectedJob = job.id; renderJobs(); },
     },
-      el("td", {}, job.id), el("td", {}, JOB_KINDS[job.kind] || job.kind),
+      el("td", { title: String(job.id) }, shortId(job.id)), el("td", {}, JOB_KINDS[job.kind] || job.kind),
       el("td", {}, el("span", { class: `status ${job.status}` }, JOB_STATUS[job.status] || job.status)),
       el("td", { class: "params" }, fmtParams(job.params)), el("td", {}, fmtDate(job.created_at)),
       el("td", { class: "num" }, jobDuration(job)), el("td", {}, jobSummary(job))));
@@ -606,7 +612,7 @@
     const job = state.jobs.find((j) => j.id === state.selectedJob);
     detail.hidden = !job;
     if (!job) return;
-    const head = el("div", { class: "card-head" }, el("h2", {}, `İş #${job.id} — ${JOB_KINDS[job.kind] || job.kind}`),
+    const head = el("div", { class: "card-head" }, el("h2", { title: String(job.id) }, `İş #${shortId(job.id)} — ${JOB_KINDS[job.kind] || job.kind}`),
       el("span", { class: `status ${job.status}` }, JOB_STATUS[job.status] || job.status));
     let body;
     if (job.status === "failed") body = el("p", { class: "error-text" }, job.error || "İş başarısız oldu.");
@@ -620,9 +626,9 @@
   function onJobFinished(job) {
     const kind = JOB_KINDS[job.kind] || job.kind;
     if (job.status === "failed") {
-      toast(`${kind} işi #${job.id} başarısız: ${job.error || "bilinmeyen hata"}`, true);
+      toast(`${kind} işi #${shortId(job.id)} başarısız: ${truncate(job.error || "bilinmeyen hata", 200)}`, true);
     } else {
-      toast(`${kind} işi #${job.id} tamamlandı.`);
+      toast(`${kind} işi #${shortId(job.id)} tamamlandı.`);
       if (job.kind === "fetch") {
         guard(loadDatasets);
         const key = job.result ? `${job.result.symbol}_${job.result.interval}` : null;
