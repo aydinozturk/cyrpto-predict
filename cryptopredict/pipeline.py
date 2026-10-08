@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -47,6 +48,27 @@ def interval_to_timedelta(interval: str) -> timedelta:
 def periods_per_year(interval: str) -> float:
     """Number of bars per (365-day) year, used to annualise the Sharpe ratio."""
     return timedelta(days=365) / interval_to_timedelta(interval)
+
+
+class OpenBarWarning(UserWarning):
+    """Unclosed bars were dropped before predicting."""
+
+
+def drop_open_bars(
+    df: pd.DataFrame,
+    interval: str,
+    now: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, int]:
+    """Drop bars that have not closed yet (``open_time + bar > now``).
+
+    Returns the closed bars and the number of dropped rows. ``now`` defaults to
+    the current UTC time; a naive ``now`` is taken as UTC.
+    """
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    closed = df.index + interval_to_timedelta(interval) <= now
+    return df.loc[closed], int((~closed).sum())
 
 
 def load_ohlcv(
@@ -128,12 +150,30 @@ def save_trained(
     )
 
 
-def predict_latest(model: Forecaster, metadata: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
-    """Forecast from the most recent complete bar of ``df`` (assumed closed).
+def predict_latest(
+    model: Forecaster,
+    metadata: dict[str, Any],
+    df: pd.DataFrame,
+    *,
+    now: pd.Timestamp | None = None,
+    include_open_bar: bool = False,
+) -> dict[str, Any]:
+    """Forecast from the most recent complete, closed bar of ``df``.
+
+    When ``metadata`` has an ``interval``, bars still open at ``now`` (default:
+    current UTC time) are dropped with an :class:`OpenBarWarning`, unless
+    ``include_open_bar``. Without an interval every bar is assumed closed.
 
     Returns the predicted ``horizon``-bar log return, the implied price and the
     direction, plus the timestamps the forecast refers to.
     """
+    dropped = 0
+    if metadata.get("interval") and not include_open_bar:
+        df, dropped = drop_open_bars(df, metadata["interval"], now)
+        if dropped:
+            warnings.warn(f"ignored {dropped} unclosed bar(s) at the end of the data", OpenBarWarning, stacklevel=2)
+        if df.empty:
+            raise ValueError("no closed bars to predict from")
     cfg = FeatureConfig.from_dict(metadata.get("feature_config") or {})
     row = latest_features(df, config=cfg)
     columns = metadata["feature_columns"]
@@ -156,6 +196,7 @@ def predict_latest(model: Forecaster, metadata: dict[str, Any], df: pd.DataFrame
         "predicted_pct_change": math.expm1(log_return) * 100,
         "expected_price": last_close * math.exp(log_return),
         "direction": "up" if log_return > 0 else "down" if log_return < 0 else "flat",
+        "dropped_open_bars": dropped,
     }
     if metadata.get("interval"):
         bar = interval_to_timedelta(metadata["interval"])
@@ -164,10 +205,10 @@ def predict_latest(model: Forecaster, metadata: dict[str, Any], df: pd.DataFrame
     return result
 
 
-def load_and_predict(model_path: str | Path, df: pd.DataFrame) -> dict[str, Any]:
+def load_and_predict(model_path: str | Path, df: pd.DataFrame, **kwargs: Any) -> dict[str, Any]:
     """:func:`predict_latest` for a model file saved by :func:`save_trained`."""
     model, metadata = load_model(model_path)
-    return predict_latest(model, metadata, df)
+    return predict_latest(model, metadata, df, **kwargs)
 
 
 @dataclass
