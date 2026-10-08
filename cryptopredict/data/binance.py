@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from datetime import datetime
 from numbers import Integral, Real
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 import requests
@@ -45,6 +46,7 @@ _INTERVAL_MILLISECONDS = {
 }
 
 TimeLike = str | int | float | datetime | pd.Timestamp
+GapMode = Literal["warn", "raise", "ignore"]
 
 
 def interval_to_milliseconds(interval: str) -> int:
@@ -112,19 +114,65 @@ def _request_page(session: Any, url: str, params: dict[str, Any]) -> list[list[A
     raise RuntimeError("Binance request failed without an error")  # pragma: no cover
 
 
-def validate_interval_continuity(df: pd.DataFrame, interval: str) -> None:
-    """Raise when a non-empty frame contains missing fixed-interval bars."""
+def find_gaps(
+    df: pd.DataFrame, interval: str
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Return pairs surrounding missing candles.
+
+    A gap must span an exact multiple of the requested interval. A non-multiple
+    indicates malformed/misaligned data and always raises rather than being
+    treated as an exchange maintenance gap.
+    """
     if len(df) < 2:
-        return
+        return []
     expected = interval_to_milliseconds(interval)
-    actual = df.index.to_series().diff().dropna().dt.total_seconds().mul(1000)
-    bad = actual[actual != expected]
-    if not bad.empty:
-        timestamp = bad.index[0]
+    timestamps = df.index
+    gaps: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for previous, current in zip(timestamps[:-1], timestamps[1:], strict=True):
+        actual = int((current.value - previous.value) // 1_000_000)
+        if actual <= 0 or actual % expected != 0:
+            raise ValueError(
+                f"irregular {interval} candle interval between "
+                f"{previous.isoformat()} and {current.isoformat()}: "
+                f"expected a positive multiple of {expected} ms, got {actual} ms"
+            )
+        if actual > expected:
+            gaps.append((previous, current))
+    return gaps
+
+
+def _gap_message(
+    gaps: list[tuple[pd.Timestamp, pd.Timestamp]], interval: str
+) -> str:
+    previous, current = gaps[0]
+    return (
+        f"found {len(gaps)} missing-candle gap(s) for {interval}; "
+        f"first gap is between {previous.isoformat()} and {current.isoformat()}"
+    )
+
+
+def validate_interval_continuity(df: pd.DataFrame, interval: str) -> None:
+    """Raise when a frame contains missing or irregular fixed-interval bars."""
+    gaps = find_gaps(df, interval)
+    if gaps:
+        previous, current = gaps[0]
+        actual = int((current.value - previous.value) // 1_000_000)
+        expected = interval_to_milliseconds(interval)
         raise ValueError(
-            f"missing or irregular {interval} candle before {timestamp.isoformat()}: "
-            f"expected {expected} ms, got {int(bad.iloc[0])} ms"
+            f"{_gap_message(gaps, interval)}; expected {expected} ms, got {actual} ms"
         )
+
+
+def _handle_gaps(df: pd.DataFrame, interval: str, on_gap: GapMode) -> None:
+    if on_gap not in {"warn", "raise", "ignore"}:
+        raise ValueError("on_gap must be one of: 'warn', 'raise', 'ignore'")
+    gaps = find_gaps(df, interval)
+    if not gaps or on_gap == "ignore":
+        return
+    if on_gap == "raise":
+        validate_interval_continuity(df, interval)
+        return  # pragma: no cover - validation always raises when gaps exist
+    warnings.warn(_gap_message(gaps, interval), RuntimeWarning, stacklevel=2)
 
 
 def _rows_to_frame(rows: list[list[Any]], *, now_ms: int) -> pd.DataFrame:
@@ -169,12 +217,14 @@ def fetch_klines(
     limit: int | None = None,
     base_url: str = DEFAULT_BASE_URL,
     session: Any | None = None,
+    on_gap: GapMode = "warn",
 ) -> pd.DataFrame:
     """Fetch closed Binance candles, paging forward in batches of at most 1000.
 
     ``limit`` is a total result cap. With neither a start nor end bound, Binance's
     latest page is returned. Duplicate candles are resolved in favor of the last
-    response, and a gap in the fixed interval raises ``ValueError``.
+    response. Exchange maintenance gaps warn by default; ``on_gap`` may instead
+    raise or ignore them. Misaligned intervals always raise.
     """
     if not symbol or not symbol.strip():
         raise ValueError("symbol must be non-empty")
@@ -239,5 +289,5 @@ def fetch_klines(
     frame = _rows_to_frame(rows, now_ms=int(pd.Timestamp.now(tz="UTC").value // 1_000_000))
     if limit is not None:
         frame = frame.iloc[:limit]
-    validate_interval_continuity(frame, interval)
+    _handle_gaps(frame, interval, on_gap)
     return frame
