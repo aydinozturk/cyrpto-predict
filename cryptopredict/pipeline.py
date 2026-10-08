@@ -20,8 +20,14 @@ import pandas as pd
 from cryptopredict.core.types import DEFAULT_HORIZON, Forecaster
 from cryptopredict.evaluation import WalkForwardResult, backtest, walk_forward_evaluate
 from cryptopredict.evaluation.backtest import BacktestResult
-from cryptopredict.features import FeatureConfig, forward_log_return, latest_features, make_dataset
-from cryptopredict.models import available_models, get_model, load_model, save_model
+from cryptopredict.features import (
+    FeatureConfig,
+    build_features,
+    forward_log_return,
+    latest_features,
+    make_dataset,
+)
+from cryptopredict.models import default_compare_models, get_model, load_model, save_model
 
 # Rolling mean return feature used by the "ma" baseline when present.
 MA_FEATURE = "ret_mean_24"
@@ -90,11 +96,16 @@ def load_ohlcv(
     return data.get_ohlcv(symbol, interval, start, end, cache_dir=cache_dir)
 
 
-def make_model(name: str, feature_columns: list[str] | None = None) -> Forecaster:
+def make_model(
+    name: str,
+    feature_columns: list[str] | None = None,
+    params: dict[str, Any] | None = None,
+) -> Forecaster:
     """Unfitted model by registry name; ``ma`` uses :data:`MA_FEATURE` when available."""
+    options = dict(params or {})
     if name == "ma" and feature_columns is not None and MA_FEATURE in feature_columns:
-        return get_model("ma", column=MA_FEATURE)
-    return get_model(name)
+        options.setdefault("column", MA_FEATURE)
+    return get_model(name, **options)
 
 
 def _period(index: pd.Index) -> dict[str, str]:
@@ -107,6 +118,7 @@ def train(
     *,
     horizon: int = DEFAULT_HORIZON,
     feature_config: FeatureConfig | None = None,
+    model_params: dict[str, Any] | None = None,
 ) -> tuple[Forecaster, dict[str, Any]]:
     """Fit ``model_name`` on every complete row of ``df``.
 
@@ -117,7 +129,8 @@ def train(
     X, y = make_dataset(df, horizon=horizon, config=cfg)
     if X.empty:
         raise ValueError("not enough history to build a training set")
-    model = make_model(model_name, list(X.columns))
+    params = dict(model_params or {})
+    model = make_model(model_name, list(X.columns), params=params)
     model.fit(X, y)
     info = {
         "horizon": horizon,
@@ -125,6 +138,7 @@ def train(
         "feature_config": cfg.to_dict(),
         "train_period": _period(X.index),
         "n_samples": len(X),
+        "model_params": params,
     }
     return model, info
 
@@ -145,6 +159,7 @@ def save_trained(
             "feature_config": info["feature_config"],
             "train_period": info["train_period"],
             "n_samples": info["n_samples"],
+            "model_params": info.get("model_params", {}),
             **extra,
         },
     )
@@ -175,13 +190,24 @@ def predict_latest(
         if df.empty:
             raise ValueError("no closed bars to predict from")
     cfg = FeatureConfig.from_dict(metadata.get("feature_config") or {})
-    row = latest_features(df, config=cfg)
     columns = metadata["feature_columns"]
-    missing = [c for c in columns if c not in row.columns]
-    if missing:
-        raise ValueError(f"data lacks feature column(s) the model was trained on: {missing}")
-    log_return = float(model.predict(row[columns])[0])
-    as_of = row.index[0]
+    lookback = int(getattr(model, "lookback", 1))
+    if lookback < 1:
+        raise ValueError(f"model lookback must be >= 1, got {lookback}")
+    # Validates the final row of the model's columns, with a clear error after a candle gap.
+    window = latest_features(df, config=cfg, columns=columns)
+    if lookback > 1:
+        # Sequence models read the last ``lookback`` rows and forecast from the final one.
+        window = build_features(df, config=cfg)[columns].tail(lookback)
+        if len(window) < lookback or window.isna().any(axis=None):
+            raise ValueError(
+                f"the model needs {lookback} complete feature rows; more contiguous history is needed"
+            )
+    predictions = np.asarray(model.predict(window), dtype="float64").ravel()
+    if predictions.size == 0 or not np.isfinite(predictions[-1]):
+        raise ValueError("model returned no finite forecast for the latest feature row")
+    log_return = float(predictions[-1])
+    as_of = window.index[-1]
     last_close = float(df.loc[as_of, "close"])
     horizon = int(metadata.get("horizon", DEFAULT_HORIZON))
     result = {
@@ -236,6 +262,7 @@ def run_backtest(
     allow_short: bool = False,
     interval: str | None = None,
     feature_config: FeatureConfig | None = None,
+    model_params: dict[str, Any] | None = None,
     dataset: tuple[pd.DataFrame, pd.Series] | None = None,
 ) -> BacktestReport:
     """Walk-forward evaluate ``model_name`` and trade the sign of its forecasts.
@@ -251,7 +278,7 @@ def run_backtest(
     X, y = dataset if dataset is not None else make_dataset(df, horizon=horizon, config=feature_config)
     columns = list(X.columns)
     evaluation = walk_forward_evaluate(
-        lambda: make_model(model_name, columns),
+        lambda: make_model(model_name, columns, params=model_params),
         X,
         y,
         n_splits=n_splits,
@@ -283,7 +310,7 @@ def compare_models(
 
     Returns a summary table (one row per model, sorted by ``rmse``) and the reports.
     """
-    names = model_names or available_models()
+    names = model_names or default_compare_models()
     horizon = kwargs.get("horizon", DEFAULT_HORIZON)
     dataset = make_dataset(df, horizon=horizon, config=kwargs.get("feature_config"))
     reports = {name: run_backtest(df, name, dataset=dataset, **kwargs) for name in names}

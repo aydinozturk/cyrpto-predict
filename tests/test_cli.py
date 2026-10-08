@@ -11,7 +11,7 @@ import pytest
 from cryptopredict import cli, data, pipeline
 from cryptopredict.evaluation import directional_accuracy
 from cryptopredict.features import forward_log_return, make_dataset
-from cryptopredict.models import available_models, load_model
+from cryptopredict.models import default_compare_models, load_model
 
 from .conftest import SAMPLE_CSV, load_sample_ohlcv
 
@@ -87,7 +87,7 @@ def test_text_output(tmp_path, capsys):
 def test_backtest_all_models(capsys):
     result = run_json(capsys, "backtest", "--csv", str(SAMPLE_CSV), "--model", "all", "--splits", "3", "--allow-short")
     names = [row["model"] for row in result["models"]]
-    assert sorted(names) == sorted(available_models())
+    assert sorted(names) == sorted(default_compare_models())
     rmse = [row["rmse"] for row in result["models"]]
     assert rmse == sorted(rmse)
 

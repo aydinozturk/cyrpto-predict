@@ -19,6 +19,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "httpx>=0.27"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+ml = ["lightgbm>=4.0"]
+deep = ["torch>=2.2"]
 
 [project.scripts]
 cryptopredict = "cryptopredict.cli:main"
