@@ -7,6 +7,11 @@ responsible for dropping rows that are not ready for model input.
 Missing candles (exchange outages) split the series into contiguous segments.
 Indicators are computed per segment, so no window or EMA state spans a gap and
 the rows right after a gap get the same warm-up ``NaN`` as the series start.
+
+Higher-timeframe (HTF) features resample each segment into longer candles
+(e.g. 4h, 1d aligned to UTC midnight) and only use *complete, closed* ones: bar
+``t`` sees the latest HTF candle whose close (``open_time + htf``) is at or
+before its own close (``t + bar``).  A partially formed HTF candle never leaks.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import math
+import re
 from typing import Any
 
 import numpy as np
@@ -39,6 +45,18 @@ class FeatureConfig:
     volatility_window: int = 24
     volume_zscore_window: int = 24
     add_time_features: bool = False
+    atr_window: int = 14
+    stoch_window: int = 14
+    stoch_smooth: int = 3
+    obv_window: int = 24
+    range_vol_window: int = 24
+    add_candle_features: bool = True
+    moment_window: int = 72
+    # Pandas offset aliases that divide a UTC day, e.g. "4h", "1d".  An HTF is
+    # skipped unless ``bar < htf <= htf_max_ratio * bar``; the ratio caps warm-up.
+    htf_intervals: tuple[str, ...] = ("4h", "1d")
+    htf_window: int = 14
+    htf_max_ratio: int = 24
 
     def __post_init__(self) -> None:
         sequence_fields = (
@@ -66,14 +84,30 @@ class FeatureConfig:
             "bollinger_window",
             "volatility_window",
             "volume_zscore_window",
+            "atr_window",
+            "stoch_window",
+            "stoch_smooth",
+            "obv_window",
+            "range_vol_window",
+            "moment_window",
+            "htf_window",
+            "htf_max_ratio",
         ):
             _require_positive_int(field_name, getattr(self, field_name))
+        if self.moment_window < 4:
+            raise ValueError("moment_window must be at least 4 (kurtosis needs 4 values)")
         if self.macd_fast >= self.macd_slow:
             raise ValueError("macd_fast must be smaller than macd_slow")
         if not math.isfinite(self.bollinger_std) or self.bollinger_std <= 0:
             raise ValueError("bollinger_std must be a positive finite number")
-        if not isinstance(self.add_time_features, bool):
-            raise ValueError("add_time_features must be a boolean")
+        for field_name in ("add_time_features", "add_candle_features"):
+            if not isinstance(getattr(self, field_name), bool):
+                raise ValueError(f"{field_name} must be a boolean")
+        if not isinstance(self.htf_intervals, tuple):
+            raise ValueError("htf_intervals must be a tuple of interval strings")
+        lengths = [_htf_length(value) for value in self.htf_intervals]
+        if len(lengths) != len(set(lengths)):
+            raise ValueError("htf_intervals must not contain duplicates")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation suitable for model metadata."""
@@ -83,6 +117,7 @@ class FeatureConfig:
             "return_mean_windows",
             "sma_windows",
             "ema_windows",
+            "htf_intervals",
         ):
             data[key] = list(data[key])
         return data
@@ -106,12 +141,15 @@ class FeatureConfig:
             "return_mean_windows",
             "sma_windows",
             "ema_windows",
+            "htf_intervals",
         ):
             if key in data:
+                if isinstance(data[key], str):
+                    raise ValueError(f"{key} must be a list, got the string {data[key]!r}")
                 try:
                     data[key] = tuple(data[key])
                 except TypeError as exc:
-                    raise ValueError(f"{key} must be an iterable of positive integers") from exc
+                    raise ValueError(f"{key} must be an iterable") from exc
         return cls(**data)
 
 
@@ -135,6 +173,26 @@ def resolve_config(config: FeatureConfigLike = None) -> FeatureConfig:
 def _require_positive_int(name: str, value: Any) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must contain/be a positive integer, got {value!r}")
+
+
+_DAY = pd.Timedelta(days=1)
+# Binance-style interval names: minutes, hours, days.
+_HTF_PATTERN = re.compile(r"(\d+)([mhd])")
+_HTF_UNITS = {"m": pd.Timedelta(minutes=1), "h": pd.Timedelta(hours=1), "d": _DAY}
+
+
+def _htf_length(value: Any) -> pd.Timedelta:
+    """Validate one ``htf_intervals`` entry and return its length."""
+    if not isinstance(value, str):
+        raise ValueError(f"htf_intervals must contain interval strings, got {value!r}")
+    match = _HTF_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(f"htf_intervals entry {value!r} is not an interval like '4h' or '1d'")
+    length = int(match[1]) * _HTF_UNITS[match[2]]
+    if length <= pd.Timedelta(0) or _DAY % length != pd.Timedelta(0):
+        # Flooring to multiples of a day divisor keeps candles aligned to UTC midnight.
+        raise ValueError(f"htf_intervals entry {value!r} must evenly divide one day")
+    return length
 
 
 BarLike = pd.Timedelta | str | None
@@ -212,15 +270,69 @@ def build_features(
     if (ohlcv["close"] <= 0.0).any():
         raise ValueError("close prices must be strictly positive")
 
-    segments = segment_ids(ohlcv.index, bar)
+    step = _resolve_bar(ohlcv.index, bar)
+    segments = segment_ids(ohlcv.index, step)
     if len(segments) == 0 or segments[-1] == 0:
-        return _segment_features(ohlcv, cfg)
-    parts = [_segment_features(part, cfg) for _, part in ohlcv.groupby(segments, sort=False)]
+        return _segment_features(ohlcv, cfg, step)
+    parts = [
+        _segment_features(part, cfg, step) for _, part in ohlcv.groupby(segments, sort=False)
+    ]
     return pd.concat(parts)
 
 
-def _segment_features(ohlcv: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
-    """Features of a validated, gap-free OHLCV frame."""
+def active_htf_intervals(config: FeatureConfigLike, bar: BarLike) -> list[tuple[str, pd.Timedelta]]:
+    """``(name, length)`` of the HTFs that :func:`build_features` uses for bars of length ``bar``.
+
+    An HTF is used when it is a whole multiple of ``bar``, longer than it and at
+    most ``htf_max_ratio`` bars long.  Without a known bar no HTF is used.
+    """
+    cfg = resolve_config(config)
+    if bar is None:
+        return []
+    step = _resolve_bar(pd.DatetimeIndex([]), bar)
+    active = []
+    for name in cfg.htf_intervals:
+        length = _htf_length(name)
+        if length > step and length % step == pd.Timedelta(0) and length <= cfg.htf_max_ratio * step:
+            active.append((name, length))
+    return active
+
+
+def required_history(config: FeatureConfigLike = None, bar: BarLike = "1h") -> int:
+    """Upper bound on the gap-free bars needed before the final feature row is complete.
+
+    Use it to size the history fetched for a live prediction.
+    """
+    cfg = resolve_config(config)
+    needed = [
+        max(cfg.return_lags) + 1,
+        max(cfg.return_mean_windows, default=0) + 1,
+        max(cfg.sma_windows + cfg.ema_windows, default=0),
+        cfg.rsi_window + 1,
+        cfg.macd_slow + cfg.macd_signal - 1,
+        cfg.bollinger_window,
+        cfg.volatility_window + 1,
+        cfg.volume_zscore_window,
+        cfg.atr_window + 1,
+        cfg.stoch_window + cfg.stoch_smooth - 1,
+        cfg.obv_window,
+        cfg.range_vol_window,
+        cfg.moment_window + 1,
+    ]
+    htf_candles = max(4, cfg.htf_window + 1)
+    step = _resolve_bar(pd.DatetimeIndex([]), bar)
+    for _, length in active_htf_intervals(cfg, step):
+        # A partly covered first candle is unusable, hence one candle extra.
+        needed.append((htf_candles + 1) * int(length / step))
+    return max(needed)
+
+
+def _segment_features(
+    ohlcv: pd.DataFrame, cfg: FeatureConfig, bar: pd.Timedelta | None = None
+) -> pd.DataFrame:
+    """Features of a validated, gap-free OHLCV frame with bars of length ``bar``."""
+    if bar is None:
+        bar = infer_bar(ohlcv.index)
     close = ohlcv["close"]
     volume = ohlcv["volume"]
     features = pd.DataFrame(index=ohlcv.index)
@@ -299,6 +411,117 @@ def _segment_features(ohlcv: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
         features["dow_sin"] = np.sin(2.0 * np.pi * day_of_week / 7.0)
         features["dow_cos"] = np.cos(2.0 * np.pi * day_of_week / 7.0)
 
+    _add_range_features(features, ohlcv, cfg)
+    for name, length in active_htf_intervals(cfg, bar):
+        _add_htf_features(features, ohlcv, cfg, bar, name, length)
+
     # Degenerate flat-price/flat-volume windows can have zero denominators.
     # Keep those rows incomplete instead of leaking infinities into estimators.
     return features.replace([np.inf, -np.inf], np.nan).astype("float64")
+
+
+def _rolling_zscore(values: pd.Series, window: int) -> pd.Series:
+    mean = values.rolling(window=window, min_periods=window).mean()
+    std = values.rolling(window=window, min_periods=window).std(ddof=0)
+    # A constant window deviates by zero standard deviations.
+    return _safe_ratio(values - mean, std).mask(std == 0.0, 0.0)
+
+
+def _add_range_features(features: pd.DataFrame, ohlcv: pd.DataFrame, cfg: FeatureConfig) -> None:
+    """ATR, stochastic, OBV, range volatility, candle shape and return moments."""
+    open_, high, low, close, volume = (ohlcv[c] for c in ("open", "high", "low", "close", "volume"))
+    previous_close = close.shift(1)
+
+    true_range = pd.concat(
+        [high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1
+    ).max(axis=1, skipna=False)
+    atr = true_range.ewm(alpha=1.0 / cfg.atr_window, adjust=False, min_periods=cfg.atr_window).mean()
+    features[f"atr_{cfg.atr_window}"] = _safe_ratio(atr, close)
+
+    lowest = low.rolling(window=cfg.stoch_window, min_periods=cfg.stoch_window).min()
+    highest = high.rolling(window=cfg.stoch_window, min_periods=cfg.stoch_window).max()
+    span = highest - lowest
+    # A flat window puts the close in the middle of its (empty) range, like RSI's 50.
+    stoch_k = (100.0 * _safe_ratio(close - lowest, span)).mask(span == 0.0, 50.0)
+    features[f"stoch_k_{cfg.stoch_window}"] = stoch_k
+    features[f"stoch_d_{cfg.stoch_window}"] = stoch_k.rolling(
+        window=cfg.stoch_smooth, min_periods=cfg.stoch_smooth
+    ).mean()
+
+    # The first bar has no previous close: it counts as unchanged.
+    signed_volume = np.sign(close.diff()).fillna(0.0) * volume
+    obv = signed_volume.cumsum()
+    features[f"obv_zscore_{cfg.obv_window}"] = _rolling_zscore(obv, cfg.obv_window)
+    signed_sum = signed_volume.rolling(window=cfg.obv_window, min_periods=cfg.obv_window).sum()
+    volume_sum = volume.rolling(window=cfg.obv_window, min_periods=cfg.obv_window).sum()
+    features[f"signed_volume_ratio_{cfg.obv_window}"] = _safe_ratio(
+        signed_sum, volume_sum
+    ).mask(volume_sum == 0.0, 0.0)
+
+    log_range = np.log(high / low)
+    log_body = np.log(close / open_)
+    window = cfg.range_vol_window
+    parkinson = (log_range**2).rolling(window=window, min_periods=window).mean() / (4.0 * math.log(2.0))
+    garman_klass = (
+        (0.5 * log_range**2 - (2.0 * math.log(2.0) - 1.0) * log_body**2)
+        .rolling(window=window, min_periods=window)
+        .mean()
+    )
+    features[f"parkinson_vol_{window}"] = np.sqrt(parkinson)
+    # The Garman-Klass variance estimate can dip below zero on tiny ranges.
+    features[f"garman_klass_vol_{window}"] = np.sqrt(garman_klass.clip(lower=0.0))
+
+    if cfg.add_candle_features:
+        bar_range = high - low
+        flat = bar_range == 0.0
+        features["candle_body"] = _safe_ratio(close - open_, bar_range).mask(flat, 0.0)
+        features["candle_upper_wick"] = _safe_ratio(
+            high - np.maximum(open_, close), bar_range
+        ).mask(flat, 0.0)
+        features["candle_lower_wick"] = _safe_ratio(
+            np.minimum(open_, close) - low, bar_range
+        ).mask(flat, 0.0)
+        features["candle_log_range"] = log_range
+
+    returns = features[LOG_RET_1]
+    window = cfg.moment_window
+    rolling = returns.rolling(window=window, min_periods=window)
+    constant = rolling.std(ddof=0) == 0.0
+    # Pandas reports kurtosis -3 for a constant window; treat it as no shape.
+    features[f"ret_skew_{window}"] = rolling.skew().mask(constant, 0.0)
+    features[f"ret_kurt_{window}"] = rolling.kurt().mask(constant, 0.0)
+
+
+def _add_htf_features(
+    features: pd.DataFrame,
+    ohlcv: pd.DataFrame,
+    cfg: FeatureConfig,
+    bar: pd.Timedelta,
+    name: str,
+    length: pd.Timedelta,
+) -> None:
+    """Features of the closed ``length`` candles of a gap-free segment, as-of joined."""
+    close = ohlcv["close"]
+    bars_per_candle = int(length / bar)
+    candle_start = ohlcv.index.floor(length)
+    grouped = close.groupby(candle_start)
+    candles = pd.DataFrame({"close": grouped.last(), "bars": grouped.size()})
+    # Only fully covered candles: the segment's first/last candle may be partial.
+    candles = candles[candles["bars"] == bars_per_candle]
+
+    htf_close = candles["close"]
+    log_close = np.log(htf_close)
+    htf = pd.DataFrame(index=candles.index)
+    htf["log_ret_1"] = log_close.diff(1)
+    htf["log_ret_3"] = log_close.diff(3)
+    htf["rsi"] = _rsi(htf_close, cfg.htf_window)
+    htf["ema"] = htf_close.ewm(span=cfg.htf_window, adjust=False, min_periods=cfg.htf_window).mean()
+    # A candle closes together with its last bar, whose open_time is start + length - bar.
+    htf.index = htf.index + length - bar
+    aligned = htf.reindex(ohlcv.index, method="ffill")
+
+    prefix = f"htf_{name}"
+    features[f"{prefix}_log_ret_1"] = aligned["log_ret_1"]
+    features[f"{prefix}_log_ret_3"] = aligned["log_ret_3"]
+    features[f"{prefix}_rsi_{cfg.htf_window}"] = aligned["rsi"]
+    features[f"{prefix}_close_ema_{cfg.htf_window}_ratio"] = _safe_ratio(close, aligned["ema"]) - 1.0

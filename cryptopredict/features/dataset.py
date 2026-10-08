@@ -6,6 +6,8 @@ Targets never span a candle gap: ``y[t]`` is only defined when bars ``t`` and
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 
@@ -84,14 +86,24 @@ def latest_features(
     df: pd.DataFrame,
     config: FeatureConfigLike = None,
     bar: BarLike = None,
+    columns: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Return the feature row of the final bar of ``df`` for live prediction.
+
+    With ``columns`` (e.g. the features a saved model was trained on) only those
+    are returned and need to be complete; other columns may still be warming up.
 
     Raises ``ValueError`` if that row is incomplete, e.g. because the final bar
     follows a candle gap too closely: an older row would silently describe a
     stale market state.
     """
     features = build_features(df, config=config, bar=bar)
+    if columns is not None:
+        columns = list(columns)
+        missing = [c for c in columns if c not in features.columns]
+        if missing:
+            raise ValueError(f"data lacks feature column(s): {missing}")
+        features = features[columns]
     if features.empty:
         raise ValueError("not enough history to build a complete feature row")
     latest = features.tail(1)
