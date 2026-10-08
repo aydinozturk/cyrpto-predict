@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>CryptoPredict Yönetim Paneli</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <strong>CryptoPredict</strong>
+      <span class="badge" id="version">sürüm —</span>
+    </div>
+    <div class="health" id="health" title="API sağlık durumu">
+      <span class="dot"></span><span class="health-text">kontrol ediliyor…</span>
+    </div>
+  </header>
+
+  <p class="disclaimer" role="note">
+    ⚠️ Bu panel araştırma amaçlıdır; tahminler <strong>yatırım tavsiyesi değildir</strong>.
+  </p>
+
+  <section class="card auth" id="auth" hidden>
+    <form id="token-form" class="row">
+      <label class="grow">Panel erişim anahtarı (CRYPTOPREDICT_DASHBOARD_TOKEN)
+        <input type="password" name="token" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Kaydet</button>
+      <button type="button" class="secondary" id="token-clear">Anahtarı sil</button>
+    </form>
+    <p class="hint" id="auth-msg"></p>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="data" aria-selected="true">Veri</button>
+    <button role="tab" data-tab="train">Eğit</button>
+    <button role="tab" data-tab="models">Modeller</button>
+    <button role="tab" data-tab="backtest">Backtest</button>
+    <button role="tab" data-tab="jobs">İşler <span class="count" id="jobs-active" hidden></span></button>
+  </nav>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <main>
+    <!-- Veri -->
+    <section class="panel" id="tab-data" role="tabpanel">
+      <div class="card">
+        <div class="card-head">
+          <h2>Önbellekteki veri setleri</h2>
+          <button type="button" class="secondary" data-action="reload-datasets">Yenile</button>
+        </div>
+        <div class="table-wrap">
+          <table id="datasets-table">
+            <thead><tr><th>Sembol</th><th>Aralık</th><th class="num">Satır</th><th>Başlangıç</th><th>Bitiş</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Kapanış fiyatı</h2>
+          <form id="chart-form" class="row compact">
+            <input name="symbol" placeholder="BTCUSDT" required aria-label="Sembol">
+            <select name="interval" aria-label="Aralık"></select>
+            <input name="limit" type="number" min="10" max="5000" value="500" aria-label="Bar sayısı">
+            <button type="submit">Göster</button>
+          </form>
+        </div>
+        <div class="chart-box">
+          <canvas id="chart" height="320"></canvas>
+          <div class="chart-tip" id="chart-tip" hidden></div>
+          <p class="hint chart-empty" id="chart-empty">Grafik için bir veri seti seçin.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Binance'ten veri çek</h2>
+        <form id="fetch-form" class="grid">
+          <label>Sembol <input name="symbol" required></label>
+          <label>Aralık <select name="interval"></select></label>
+          <label>Başlangıç <input name="start" type="date" required></label>
+          <label>Bitiş (ops.) <input name="end" type="date"></label>
+          <div class="actions"><button type="submit">Çek (arka plan işi)</button></div>
+        </form>
+      </div>
+    </section>
+
+    <!-- Eğit -->
+    <section class="panel" id="tab-train" role="tabpanel" hidden>
+      <div class="card">
+        <h2>Model eğit</h2>
+        <form id="train-form" class="grid">
+          <label>Sembol <input name="symbol" required></label>
+          <label>Aralık <select name="interval"></select></label>
+          <label>Model <select name="model" data-models></select></label>
+          <label>Ufuk (bar) <input name="horizon" type="number" min="1" value="1" required></label>
+          <label>Başlangıç (ops.) <input name="start" type="date"></label>
+          <label>Ad (ops.) <input name="name" pattern="[A-Za-z0-9_.\-]+" placeholder="SEMBOL_aralık_model_hN"></label>
+          <div class="actions"><button type="submit">Eğit (arka plan işi)</button></div>
+        </form>
+        <p class="hint">Başlangıç boşsa önbellekteki veri kullanılır. Ad yalnızca harf, rakam, <code>_ . -</code> içerebilir.</p>
+      </div>
+    </section>
+
+    <!-- Modeller -->
+    <section class="panel" id="tab-models" role="tabpanel" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>Kayıtlı modeller</h2>
+          <div class="row compact">
+            <label class="check"><input type="checkbox" id="predict-refresh"> Tahminden önce eksik mumları çek</label>
+            <button type="button" class="secondary" data-action="reload-models">Yenile</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="models-table">
+            <thead><tr><th>Ad</th><th>Model</th><th>Sembol</th><th>Aralık</th><th class="num">Ufuk</th><th>Eğitim dönemi</th><th class="num">Örnek</th><th>Oluşturma</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" id="prediction" hidden></div>
+    </section>
+
+    <!-- Backtest -->
+    <section class="panel" id="tab-backtest" role="tabpanel" hidden>
+      <div class="card">
+        <h2>Walk-forward backtest</h2>
+        <form id="backtest-form" class="grid">
+          <label>Sembol <input name="symbol" required></label>
+          <label>Aralık <select name="interval"></select></label>
+          <label>Model <select name="model" data-models data-all></select></label>
+          <label>Başlangıç (ops.) <input name="start" type="date"></label>
+          <label>Ufuk (bar) <input name="horizon" type="number" min="1" value="1"></label>
+          <label>Katman (splits) <input name="splits" type="number" min="2" value="5"></label>
+          <label>Komisyon (bps) <input name="fee_bps" type="number" min="0" step="any" value="10"></label>
+          <label>Kayma (bps) <input name="slippage_bps" type="number" min="0" step="any" value="0"></label>
+          <label>Pozisyon eşiği <input name="threshold" type="number" min="0" step="any" value="0"></label>
+          <label>Yön isabeti eşiği <input name="da_threshold" type="number" min="0" step="any" value="0"></label>
+          <label class="check"><input type="checkbox" name="allow_short"> Açığa satışa izin ver</label>
+          <div class="actions"><button type="submit">Çalıştır (arka plan işi)</button></div>
+        </form>
+      </div>
+      <div class="card" id="backtest-result" hidden></div>
+    </section>
+
+    <!-- İşler -->
+    <section class="panel" id="tab-jobs" role="tabpanel" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>Arka plan işleri</h2>
+          <button type="button" class="secondary" data-action="reload-jobs">Yenile</button>
+        </div>
+        <p class="hint">İşler tek kuyrukta sırayla çalışır ve sunucu yeniden başlatılınca liste silinir.</p>
+        <div class="table-wrap">
+          <table id="jobs-table">
+            <thead><tr><th>#</th><th>Tür</th><th>Durum</th><th>Parametreler</th><th>Oluşturma</th><th>Süre</th><th>Sonuç / hata</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" id="job-detail" hidden></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span id="dirs"></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
