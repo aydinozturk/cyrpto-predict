@@ -1,0 +1,35 @@
+# Runs the dashboard. Uses the image published by GitHub Actions (GHCR);
+# `docker compose build` builds it locally from this checkout instead.
+#   cp .env.example .env   # optional, then edit
+#   docker compose up -d
+#   open http://127.0.0.1:8000
+services:
+  dashboard:
+    image: ${CRYPTOPREDICT_IMAGE:-ghcr.io/aydinozturk/cyrpto-predict:latest}
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # fixed inside the container (they match the image, the port mapping and
+      # the volume); these override any value coming from .env
+      CRYPTOPREDICT_HOST: 0.0.0.0
+      CRYPTOPREDICT_PORT: "8000"
+      CRYPTOPREDICT_DATA_DIR: /data/cache
+      CRYPTOPREDICT_MODEL_DIR: /data/models
+    ports:
+      # bound to localhost by default; set CRYPTOPREDICT_BIND=0.0.0.0 (and a
+      # CRYPTOPREDICT_DASHBOARD_TOKEN) to expose it on the network
+      - "${CRYPTOPREDICT_BIND:-127.0.0.1}:${CRYPTOPREDICT_PUBLISH_PORT:-8000}:8000"
+    volumes:
+      - cryptopredict-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  cryptopredict-data:
