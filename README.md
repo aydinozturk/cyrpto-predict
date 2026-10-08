@@ -19,6 +19,7 @@ gerçekten daha iyi olup olmadığını **dürüst** biçimde ölçmektir.
 
 - [Kurulum](#kurulum)
 - [Hızlı başlangıç (CLI)](#hızlı-başlangıç-cli)
+- [Dashboard & Docker](#dashboard--docker)
 - [Binance erişimi](#binance-erişimi)
 - [Mimari](#mimari)
 - [Hedef değişken ve özellikler](#hedef-değişken-ve-özellikler)
@@ -109,6 +110,24 @@ kapanışın zamanı: `as_of + (horizon + 1) × aralık`), `last_close`,
 `dropped_open_bars` (atlanan kapanmamış mum sayısı).
 
 CSV biçimi: `open_time` (UTC zaman damgası) ve `open,high,low,close,volume` kolonları.
+
+## Dashboard & Docker
+
+FastAPI tabanlı yönetim paneli; veri çekme, model eğitme, kayıtlı modellerden
+tahmin üretme, walk-forward backtest çalıştırma ve arka plan işlerini izleme
+ekranlarını tek serviste sunar. Yerel imajı oluşturup paneli yalnızca bu makinede
+açmak için:
+
+```bash
+cp .env.example .env
+docker compose up -d --build dashboard
+```
+
+Panel `http://127.0.0.1:8000` adresindedir. Portu ağdaki başka makinelere
+açacaksanız `.env` içinde güçlü bir `CRYPTOPREDICT_DASHBOARD_TOKEN` tanımlayın.
+GHCR/Docker Hub yayın ayarları, private GHCR girişi, volume yönetimi, güncelleme
+komutları ve uçtan uca panel testi için [Dashboard ve Docker dağıtım
+rehberine](docs/deploy.md) bakın.
 
 ## Binance erişimi
 
