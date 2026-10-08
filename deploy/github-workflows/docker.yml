@@ -1,0 +1,178 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build without publishing
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image name
+        id: names
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+        run: |
+          image_path="${IMAGE_NAME:-$GITHUB_REPOSITORY}"
+          image_path="${image_path#ghcr.io/}"
+          image_path="${image_path,,}"
+          if [[ ! "$image_path" =~ ^[a-z0-9._-]+/[a-z0-9._/-]+$ ]]; then
+            echo "IMAGE_NAME must be an owner/image path, optionally prefixed with ghcr.io" >&2
+            exit 1
+          fi
+          echo "ghcr_image=ghcr.io/$image_path" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.ghcr_image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.description=CryptoPredict dashboard and forecasting service
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    name: Build and publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve registry settings
+        id: names
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          image_path="${IMAGE_NAME:-$GITHUB_REPOSITORY}"
+          image_path="${image_path#ghcr.io/}"
+          image_path="${image_path,,}"
+          if [[ ! "$image_path" =~ ^[a-z0-9._-]+/[a-z0-9._/-]+$ ]]; then
+            echo "IMAGE_NAME must be an owner/image path, optionally prefixed with ghcr.io" >&2
+            exit 1
+          fi
+          ghcr_image="ghcr.io/$image_path"
+
+          dockerhub_enabled=false
+          dockerhub_image=""
+          if [[ -n "$DOCKERHUB_USERNAME" && -n "$DOCKERHUB_TOKEN" ]]; then
+            dockerhub_user="${DOCKERHUB_USERNAME,,}"
+            dockerhub_repo="${DOCKERHUB_REPO:-cyrpto-predict}"
+            dockerhub_repo="${dockerhub_repo,,}"
+            if [[ ! "$dockerhub_user" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+               [[ ! "$dockerhub_repo" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+              echo "Docker Hub username or repository name is invalid" >&2
+              exit 1
+            fi
+            dockerhub_enabled=true
+            dockerhub_image="docker.io/$dockerhub_user/$dockerhub_repo"
+          fi
+
+          {
+            echo "ghcr_image=$ghcr_image"
+            echo "dockerhub_enabled=$dockerhub_enabled"
+            echo "dockerhub_image=$dockerhub_image"
+            echo "images<<EOF"
+            echo "$ghcr_image"
+            if [[ "$dockerhub_enabled" == "true" ]]; then
+              echo "$dockerhub_image"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.names.outputs.dockerhub_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.images }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.description=CryptoPredict dashboard and forecasting service
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
