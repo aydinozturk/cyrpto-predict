@@ -4,6 +4,7 @@ import pytest
 from sklearn.base import clone
 
 from cryptopredict.core.types import LOG_RET_1, Forecaster
+from cryptopredict.models import registry
 from cryptopredict.models import (
     GBMForecaster,
     LastReturn,
@@ -12,6 +13,7 @@ from cryptopredict.models import (
     RidgeForecaster,
     ZeroReturn,
     available_models,
+    default_compare_models,
     get_model,
     load_model,
     save_model,
@@ -40,13 +42,55 @@ def mae(a, b) -> float:
     return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
 
 
+class HeavyModel(ZeroReturn):
+    """Stand-in for a slow optional model (e.g. lstm)."""
+
+    name = "fake_heavy"
+    heavy = True
+
+
 def test_registry():
-    assert available_models() == ALL_NAMES
+    # Core models first; installed optional models (lgbm, ...) may follow.
+    assert available_models()[: len(ALL_NAMES)] == ALL_NAMES
+    assert set(available_models()) <= set(ALL_NAMES) | set(registry.LAZY_MODELS)
     assert isinstance(get_model("ridge", alpha=3.0), RidgeForecaster)
     assert get_model("ridge", alpha=3.0).alpha == 3.0
     assert get_model("ma", window=5).window == 5
     with pytest.raises(ValueError, match="unknown model"):
-        get_model("lstm")
+        get_model("nope")
+
+
+@pytest.mark.parametrize(
+    "target", ["cryptopredict_missing_module_xyz:Model", "cryptopredict.models.baseline:Missing", "bad-target"]
+)
+def test_lazy_model_with_missing_dependency_is_hidden(monkeypatch, target):
+    monkeypatch.setitem(registry.LAZY_MODELS, "fake_ml", target)
+    assert "fake_ml" not in available_models()
+    assert "fake_ml" not in default_compare_models()
+    assert available_models()[: len(ALL_NAMES)] == ALL_NAMES
+    with pytest.raises(ValueError, match=r"unavailable.*pip install cryptopredict\[ml\]"):
+        get_model("fake_ml")
+
+
+def test_lazy_model_import_error_never_breaks_registry(monkeypatch, tmp_path):
+    (tmp_path / "cp_broken_model_xyz.py").write_text("raise RuntimeError('boom')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(registry.LAZY_MODELS, "broken", "cp_broken_model_xyz:Model")
+    monkeypatch.setitem(registry._MODEL_EXTRAS, "broken", "deep")
+    assert "broken" not in available_models()
+    with pytest.raises(ValueError, match=r"boom.*cryptopredict\[deep\]"):
+        get_model("broken")
+
+
+def test_heavy_models_are_left_out_of_default_comparison(monkeypatch):
+    monkeypatch.setitem(registry.LAZY_MODELS, "fake_heavy", f"{__name__}:HeavyModel")
+    monkeypatch.setitem(registry.LAZY_MODELS, "fake_light", "cryptopredict.models.baseline:MeanReturn")
+    assert {"fake_heavy", "fake_light"} <= set(available_models())
+    assert "fake_heavy" not in default_compare_models()
+    assert "fake_light" in default_compare_models()
+    assert default_compare_models()[: len(ALL_NAMES)] == ALL_NAMES
+    model = get_model("fake_heavy")
+    assert isinstance(model, HeavyModel) and model.heavy
 
 
 @pytest.mark.parametrize("name", ALL_NAMES)
