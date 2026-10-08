@@ -126,7 +126,9 @@ verilebilir (`fetch_klines`, `get_ohlcv`). Yalnızca **kapanmış** mumlar döne
 istekler 1000'lik sayfalarla ilerler ve 418/429/5xx yanıtlarında yeniden denenir.
 Binance geçmişinde bakım/kesinti kaynaklı gerçek mum boşlukları vardır (ör.
 2023-03-24); bunlar varsayılan olarak uyarı verir (`on_gap="warn"`), `"raise"`
-hata fırlatır, `"ignore"` sessiz geçer.
+hata fırlatır, `"ignore"` sessiz geçer. Uyarıyla devam edilen boşluklu veri
+güvenlidir: özellik katmanı boşlukları aşan pencere ve hedefleri veri setinden
+çıkarır (bkz. [Mum boşlukları](#mum-boşlukları)).
 
 Önbellek: `get_ohlcv` mumları `<cache_dir>/<SYMBOL>_<interval>.csv` dosyasında
 tutar (ör. `data/BTCUSDT_1h.csv`) ve yalnızca eksik kalan aralıkları çeker.
@@ -199,9 +201,9 @@ veriyi kullanır):
 | `close_ema_6_ratio`, `close_ema_12_ratio`, `close_ema_24_ratio` | Kapanışın üstel hareketli ortalamadan göreli sapması: `close / EMA − 1` |
 | `rsi_14` | 14 barlık RSI (Wilder yumuşatması, 0–100) |
 | `macd`, `macd_signal` | MACD (EMA12 − EMA26) ve sinyal çizgisi (EMA9); ham fiyat biriminde |
-| `bollinger_pct_b_20`, `bollinger_width_20` | Bollinger bandı (20, 2σ) içindeki konum ve bant genişliği |
+| `bollinger_pct_b_20`, `bollinger_width_20` | Bollinger bandı (20, 2σ) içindeki konum ve bant genişliği (sabit fiyatlı pencerede `0.5` ve `0`) |
 | `volatility_24` | Son 24 barın 1-bar log-getiri standart sapması |
-| `volume_zscore_24` | Hacmin 24 barlık z-skoru |
+| `volume_zscore_24` | Hacmin 24 barlık z-skoru (sabit hacimde `0`) |
 | `hour_sin`, `hour_cos`, `dow_sin`, `dow_cos` | Saat / haftanın günü (yalnızca `add_time_features=True` ise) |
 
 Kolon adları pencere parametrelerinden türetilir (ör. `rsi_window=21` → `rsi_21`).
@@ -210,13 +212,34 @@ Varsayılanlar `FeatureConfig(...)` ya da kısmi bir sözlükle değiştirilebil
 `FeatureConfig.to_dict()` / `FeatureConfig.from_dict()` yapılandırmayı model
 metadata'sına yazıp tahminde aynı özellikleri yeniden üretmeye yarar.
 
-- `features.build_features(df, config)` — tüm özellikler, `df` ile aynı indeks;
-  ısınma (warmup) satırları NaN kalır.
-- `features.make_dataset(df, horizon, config)` → `(X, y)`: ısınma satırları ve
-  hedefi henüz bilinmeyen son `h` satır atılır; `X` ve `y` aynı indeksi paylaşır,
-  NaN/sonsuz değer içermez (impute yapılmaz).
-- `features.latest_features(df, config)` — canlı tahmin için son eksiksiz satır.
-- `features.forward_log_return(close, horizon)` / `features.make_target(df, horizon)` — hedef serisi.
+- `features.build_features(df, config, bar=None)` — tüm özellikler, `df` ile aynı
+  indeks; ısınma (warmup) satırları NaN kalır (serinin başında ve her boşluktan sonra).
+- `features.make_dataset(df, horizon, config, bar=None)` → `(X, y)`: ısınma
+  satırları, hedefi henüz bilinmeyen son `h` satır ve hedefi bir boşluğu aşan
+  satırlar atılır; `X` ve `y` aynı indeksi paylaşır, NaN/sonsuz değer içermez
+  (impute yapılmaz).
+- `features.latest_features(df, config, bar=None)` — canlı tahmin için **son barın**
+  özellik satırı. O satır eksikse (yetersiz geçmiş ya da son bar bir boşluktan
+  hemen sonra ısınmada) daha eski bir satıra düşmek yerine `ValueError` verir.
+- `features.forward_log_return(close, horizon, bar=None)` /
+  `features.make_target(df, horizon, bar=None)` — hedef serisi (boşluğu aşan değerler NaN).
+- `features.infer_bar(index)` / `features.segment_ids(index, bar=None)` — bar süresi
+  ve kesintisiz segment numaraları (aşağıya bakın).
+
+### Mum boşlukları
+
+Borsa bakım/kesintilerinde bazı mumlar hiç yoktur. Boşluktan sonraki bar bitişik
+sayılsaydı `h=1` hedefi aslında 2 barlık getiri olur, pencereler kesintinin
+üzerinden hesaplanırdı. Bunun yerine:
+
+- Bar süresi indeksteki en sık adımdır (`infer_bar`; eşitlikte en küçüğü) ya da
+  `bar=pd.Timedelta("1h")` ile açıkça verilir. Bundan uzun her adım yeni bir
+  **segment** başlatır (`segment_ids`; boşluksuz veride hepsi 0).
+- Göstergeler her segmentte ayrı hesaplanır: boşluktan sonraki satırlar serinin
+  başındaki kadar ısınma NaN'ı alır ve EMA/MACD/RSI durumu boşluğu aşmaz.
+- `t` ve `t + h` farklı segmentteyse `target[t]` NaN olur; `make_dataset` bu
+  satırları atar.
+- Boşluksuz veride çıktı bu davranıştan önceki sürümle birebir aynıdır.
 
 ## Modeller
 
@@ -351,6 +374,11 @@ kapanmış BTCUSDT 1h mumu) ve sahte (mock) HTTP yanıtları kullanır.
   komisyon/kayma, likidite, fonlama (funding) ve vergi yok; `h > 1` modelleri
   backtest'te yine bir sonraki barın getirisiyle değerlendirilir.
 - Tek sembol, tek zaman aralığı; portföy veya çoklu varlık yok.
+- Mum boşluklarında atılan satırlar backtest'te de yoktur: boşluk ve sonrasındaki
+  ısınma dönemindeki getiriler (strateji ve buy-and-hold için) hesaba girmez.
+  Walk-forward katları satır sayısına göre bölünür, yani boşluklu veride katlar
+  eşit süreli olmayabilir. Takvim ayı (`1M`) gibi değişken uzunluklu barlar
+  desteklenmez.
 - Model seçimi aynı walk-forward sonuçlarına bakılarak yapılırsa iyimser yanlılık
   (overfitting) oluşur; son karar için ayrı, hiç görülmemiş bir dönem kullanın.
 
@@ -361,7 +389,8 @@ kapanmış BTCUSDT 1h mumu) ve sahte (mock) HTTP yanıtları kullanır.
 
 **cryptopredict** forecasts the h-step-ahead **log return** of a crypto asset
 (`target[t] = log(close[t+h] / close[t])`) from Binance OHLCV candles. It builds
-leakage-free technical features (`FeatureConfig`), fits baselines (`zero`, `mean`,
+leakage-free technical features (`FeatureConfig`; computed per contiguous
+segment so neither features nor targets span missing candles), fits baselines (`zero`, `mean`,
 `last`, `ma`) and learned models (`ridge`, `gbm`), and evaluates them with
 time-ordered **walk-forward validation** (fresh model per fold, `gap = horizon`)
 and a fee/slippage-aware long/flat(/short) **backtest** against buy-and-hold.
