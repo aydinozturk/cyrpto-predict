@@ -94,7 +94,7 @@ cryptopredict predict  --csv $CSV --model-path models/x.joblib --json
 | `fetch` | `--out PATH.csv` | Mumları çeker, önbelleğe (ve isteğe bağlı `--out`'a) yazar, özet basar |
 | `train` | `--model NAME --horizon H --out PATH.joblib` | Tüm veriyle modeli eğitir; model, özellik yapılandırması, sembol/aralık ve eğitim dönemiyle birlikte kaydeder (varsayılan model `ridge`, horizon `1`) |
 | `predict` | `--model-path PATH [--csv PATH]` | Son **kapanmış** mum için tahmini log-getiri, beklenen fiyat, yön (yukarı/aşağı) ve horizon'u basar. `--csv` yoksa modelin metadata'sındaki sembol/aralık için son ~500 bar çekilir (CSV ile eğitilmiş modelde `--symbol` verin) |
-| `backtest` | `--model NAME\|all --horizon H --splits K --fee-bps F [--slippage-bps S] [--threshold T] [--allow-short]` | Walk-forward kat metrikleri, genel metrikler ve strateji vs. buy-and-hold; `all` ile tüm modelleri RMSE'ye göre sıralı bir tabloda karşılaştırır. Varsayılanlar: `--splits 5`, `--fee-bps 10`, `gap = horizon`. `--threshold` hem pozisyon eşiği hem de yön isabetindeki nötr bant olarak kullanılır |
+| `backtest` | `--model NAME\|all --horizon H --splits K --fee-bps F [--slippage-bps S] [--threshold T] [--da-threshold D] [--allow-short]` | Walk-forward kat metrikleri, genel metrikler ve strateji vs. buy-and-hold; `all` ile tüm modelleri RMSE'ye göre sıralı bir tabloda karşılaştırır. Varsayılanlar: `--splits 5`, `--fee-bps 10`, `gap = horizon`. `--threshold` yalnız pozisyon eşiğidir (`\|tahmin\| > T` ise işlem); `--da-threshold` yön isabetindeki nötr banttır (`\|gerçek\| <= D` olan barlar hariç). İkisinin de varsayılanı 0 |
 
 Model adları: `zero`, `mean`, `last`, `ma`, `ridge`, `gbm`.
 
@@ -265,7 +265,7 @@ Nokta tahmin metrikleri (`evaluation.regression_report`):
 | `mae` | Ortalama mutlak hata — log-getiri biriminde (0.001 ≈ %0.1) |
 | `rmse` | Kök ortalama kare hata — büyük hataları daha çok cezalandırır |
 | `smape` | Simetrik MAPE, yüzde (0–200). Getiriler 0'a yakın olduğundan oynaktır; dikkatli yorumlayın |
-| `directional_accuracy` | Yön isabeti: `sign(tahmin) == sign(gerçek)` oranı. `threshold` altındaki küçük hareketler hariç tutulur. 0.5 ≈ yazı-tura; `zero` hiç yön tahmin etmediği için 0 alır |
+| `directional_accuracy` | Yön isabeti: `sign(tahmin) == sign(gerçek)` oranı. `\|gerçek\|` değeri `--da-threshold` altında kalan küçük hareketler hariç tutulur (varsayılan 0). 0.5 ≈ yazı-tura; `zero` hiç yön tahmin etmediği için 0 alır |
 | `relative_mae` | `MAE(model) / MAE(zero baseline)`. **< 1 ise model "getiri = 0" baseline'ını yener**; ≥ 1 ise yenemez |
 
 Backtest (`evaluation.backtest`) tahminin işaretiyle işlem yapar: tahmin

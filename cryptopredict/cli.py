@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fee-bps", type=float, default=10.0, help="fee per position change, bps (default: %(default)s)")
     p.add_argument("--slippage-bps", type=float, default=0.0, help="slippage per position change, bps (default: %(default)s)")
     p.add_argument("--threshold", type=float, default=0.0, help="min |forecast| to take a position (default: %(default)s)")
+    p.add_argument("--da-threshold", type=float, default=0.0, help="ignore |actual return| <= this in directional accuracy (default: %(default)s)")
     p.add_argument("--allow-short", action="store_true", help="go short on negative forecasts")
     _add_json_arg(p)
     p.set_defaults(func=cmd_backtest)
@@ -202,6 +203,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
         threshold=args.threshold,
+        da_threshold=args.da_threshold,
         allow_short=args.allow_short,
         interval=args.interval,
     )
