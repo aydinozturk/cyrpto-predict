@@ -1,4 +1,8 @@
-"""Target creation and feature/target alignment."""
+"""Target creation and feature/target alignment.
+
+Targets never span a candle gap: ``y[t]`` is only defined when bars ``t`` and
+``t + h`` belong to the same contiguous segment (see :func:`segment_ids`).
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import pandas as pd
 
 from cryptopredict.core.types import DEFAULT_HORIZON, TARGET_COLUMN, validate_ohlcv
 
-from .indicators import FeatureConfigLike, build_features
+from .indicators import BarLike, FeatureConfigLike, build_features, segment_ids
 
 
 def _validate_horizon(horizon: int) -> None:
@@ -18,8 +22,13 @@ def _validate_horizon(horizon: int) -> None:
 def forward_log_return(
     close: pd.Series,
     horizon: int = DEFAULT_HORIZON,
+    bar: BarLike = None,
 ) -> pd.Series:
-    """Return ``log(close[t + horizon] / close[t])`` on ``close``'s index."""
+    """Return ``log(close[t + horizon] / close[t])`` on ``close``'s index.
+
+    With a ``DatetimeIndex``, values whose ``horizon`` bars span a candle gap
+    (a step longer than ``bar``, inferred by default) are ``NaN``.
+    """
     _validate_horizon(horizon)
     if not isinstance(close, pd.Series):
         raise ValueError(f"close must be a pandas Series, got {type(close).__name__}")
@@ -30,30 +39,39 @@ def forward_log_return(
         raise ValueError("close must not contain NaN")
     if (values <= 0.0).any():
         raise ValueError("close prices must be strictly positive")
-    return np.log(values.shift(-horizon) / values).rename(TARGET_COLUMN)
+    result = np.log(values.shift(-horizon) / values)
+    if isinstance(values.index, pd.DatetimeIndex):
+        segments = pd.Series(segment_ids(values.index, bar), index=values.index)
+        result = result.where(segments.shift(-horizon) == segments)
+    elif bar is not None:
+        raise ValueError("bar requires close to have a DatetimeIndex")
+    return result.rename(TARGET_COLUMN)
 
 
 def make_target(
     df: pd.DataFrame,
     horizon: int = DEFAULT_HORIZON,
+    bar: BarLike = None,
 ) -> pd.Series:
     """Create the forward log-return target defined by the shared contract."""
     ohlcv = validate_ohlcv(df)
-    return forward_log_return(ohlcv["close"], horizon=horizon)
+    return forward_log_return(ohlcv["close"], horizon=horizon, bar=bar)
 
 
 def make_dataset(
     df: pd.DataFrame,
     horizon: int = DEFAULT_HORIZON,
     config: FeatureConfigLike = None,
+    bar: BarLike = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return aligned, finite ``(X, y)`` ready for estimator input.
 
-    Both indicator warm-up rows and the final ``horizon`` rows without a known
-    target are removed.  No imputation is performed.
+    Indicator warm-up rows (after the series start and after every candle gap)
+    and rows without a known target (the final ``horizon`` rows and those whose
+    target spans a gap) are removed.  No imputation is performed.
     """
-    X_all = build_features(df, config=config)
-    y_all = make_target(df, horizon=horizon)
+    X_all = build_features(df, config=config, bar=bar)
+    y_all = make_target(df, horizon=horizon, bar=bar)
     valid = X_all.notna().all(axis=1) & y_all.notna()
     X = X_all.loc[valid].copy()
     y = y_all.loc[valid].copy()
@@ -65,9 +83,27 @@ def make_dataset(
 def latest_features(
     df: pd.DataFrame,
     config: FeatureConfigLike = None,
+    bar: BarLike = None,
 ) -> pd.DataFrame:
-    """Return the most recent complete feature row for live prediction."""
-    complete = build_features(df, config=config).dropna(axis=0, how="any")
-    if complete.empty:
+    """Return the feature row of the final bar of ``df`` for live prediction.
+
+    Raises ``ValueError`` if that row is incomplete, e.g. because the final bar
+    follows a candle gap too closely: an older row would silently describe a
+    stale market state.
+    """
+    features = build_features(df, config=config, bar=bar)
+    if features.empty:
         raise ValueError("not enough history to build a complete feature row")
-    return complete.tail(1).copy()
+    latest = features.tail(1)
+    if latest.isna().any(axis=None):
+        segments = segment_ids(features.index, bar)
+        if segments[-1] > 0:
+            since_gap = int((segments == segments[-1]).sum())
+            gap_end = features.index[len(features) - since_gap]
+            raise ValueError(
+                f"the final bar is only {since_gap} bar(s) after a candle gap ending at "
+                f"{gap_end.isoformat()}; more history after the gap is needed to build "
+                "a complete feature row"
+            )
+        raise ValueError("not enough history to build a complete feature row")
+    return latest.copy()
