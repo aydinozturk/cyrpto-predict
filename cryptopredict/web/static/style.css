@@ -35,6 +35,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -108,7 +109,7 @@ code { font-size: .9em; }
 
 main, .auth { max-width: 1200px; margin: 0 auto; }
 main { padding: 1rem 1.25rem 2rem; }
-.auth { margin-top: 1rem; }
+.auth { margin-top: 1rem; width: calc(100% - 2.5rem); }
 
 .card {
   background: var(--surface);
