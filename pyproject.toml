@@ -17,13 +17,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "httpx>=0.27"]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
 
 [project.scripts]
 cryptopredict = "cryptopredict.cli:main"
+cryptopredict-web = "cryptopredict.web.app:main"
 
 [tool.setuptools.packages.find]
 include = ["cryptopredict*"]
+
+[tool.setuptools.package-data]
+cryptopredict = ["web/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
