@@ -11,11 +11,12 @@ import pandas as pd
 from cryptopredict.core.types import INDEX_NAME, OHLCV_COLUMNS, validate_ohlcv
 from cryptopredict.data.binance import (
     DEFAULT_BASE_URL,
+    GapMode,
     TimeLike,
+    _handle_gaps,
     fetch_klines,
     interval_to_milliseconds,
     timestamp_to_milliseconds,
-    validate_interval_continuity,
 )
 from cryptopredict.data.loader import load_csv, save_csv
 
@@ -49,6 +50,7 @@ def get_ohlcv(
     *,
     base_url: str = DEFAULT_BASE_URL,
     session: Any | None = None,
+    on_gap: GapMode = "warn",
 ) -> pd.DataFrame:
     """Load cached candles and fetch only ranges missing on either side.
 
@@ -73,6 +75,7 @@ def get_ohlcv(
             end=missing_end,
             base_url=base_url,
             session=session,
+            on_gap="ignore",
         )
         if not frame.empty:
             additions.append(frame)
@@ -91,7 +94,7 @@ def get_ohlcv(
     merged = pd.concat(pieces).sort_index()
     merged = merged.loc[~merged.index.duplicated(keep="last")]
     merged = validate_ohlcv(merged)
-    validate_interval_continuity(merged, interval)
+    _handle_gaps(merged, interval, on_gap)
     save_csv(merged, path)
 
     result = merged

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import pandas as pd
@@ -111,12 +112,54 @@ def test_fetch_klines_does_not_retry_non_retryable_client_error(monkeypatch):
     assert sleeps == []
 
 
-def test_fetch_klines_rejects_missing_candle():
+def test_fetch_klines_warns_and_returns_frame_with_missing_candle():
     start = int(pd.Timestamp("2024-01-01", tz="UTC").value // 1_000_000)
     session = FakeSession([FakeResponse([_kline(start), _kline(start + 2 * HOUR_MS)])])
 
-    with pytest.raises(ValueError, match="missing or irregular"):
-        fetch_klines("BTCUSDT", "1h", start=start, session=session)
+    with pytest.warns(RuntimeWarning, match="1 missing-candle gap"):
+        result = fetch_klines("BTCUSDT", "1h", start=start, session=session)
+
+    assert len(result) == 2
+
+
+def test_fetch_klines_can_raise_or_ignore_missing_candle():
+    start = int(pd.Timestamp("2024-01-01", tz="UTC").value // 1_000_000)
+    page = [_kline(start), _kline(start + 2 * HOUR_MS)]
+
+    with pytest.raises(ValueError, match="1 missing-candle gap"):
+        fetch_klines(
+            "BTCUSDT",
+            "1h",
+            start=start,
+            session=FakeSession([FakeResponse(page)]),
+            on_gap="raise",
+        )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = fetch_klines(
+            "BTCUSDT",
+            "1h",
+            start=start,
+            session=FakeSession([FakeResponse(page)]),
+            on_gap="ignore",
+        )
+    assert caught == []
+    assert len(result) == 2
+
+
+def test_fetch_klines_always_rejects_irregular_interval():
+    start = int(pd.Timestamp("2024-01-01", tz="UTC").value // 1_000_000)
+    page = [_kline(start), _kline(start + HOUR_MS + HOUR_MS // 2)]
+
+    with pytest.raises(ValueError, match="irregular 1h candle interval"):
+        fetch_klines(
+            "BTCUSDT",
+            "1h",
+            start=start,
+            session=FakeSession([FakeResponse(page)]),
+            on_gap="ignore",
+        )
 
 
 def test_csv_round_trip_preserves_contract(tmp_path, ohlcv):
@@ -173,3 +216,19 @@ def test_get_ohlcv_uses_cache_when_range_is_covered(monkeypatch, tmp_path, ohlcv
     )
 
     pd.testing.assert_frame_equal(result, ohlcv.iloc[1:4], check_freq=False)
+
+
+def test_get_ohlcv_warns_but_uses_cache_with_exchange_gap(tmp_path, ohlcv):
+    gapped = ohlcv.iloc[[0, 1, 3, 4]]
+    save_csv(gapped, tmp_path / "BTCUSDT_1h.csv")
+
+    with pytest.warns(RuntimeWarning, match="1 missing-candle gap"):
+        result = get_ohlcv(
+            "BTCUSDT",
+            "1h",
+            start=gapped.index[0],
+            end=gapped.index[-1],
+            cache_dir=tmp_path,
+        )
+
+    pd.testing.assert_frame_equal(result, gapped, check_freq=False)
