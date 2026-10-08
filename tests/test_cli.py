@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from cryptopredict import cli, data, pipeline
+from cryptopredict.evaluation import directional_accuracy
 from cryptopredict.features import forward_log_return, make_dataset
 from cryptopredict.models import available_models, load_model
 
@@ -186,3 +187,41 @@ def test_interval_to_timedelta_rejects_invalid(interval):
 def test_periods_per_year():
     assert pipeline.periods_per_year("1h") == 24 * 365
     assert pipeline.periods_per_year("1d") == 365
+
+
+def test_position_threshold_does_not_change_directional_accuracy():
+    df = load_sample_ohlcv()
+    base = pipeline.run_backtest(df, "ridge", n_splits=3)
+    preds = base.evaluation.predictions
+    threshold = float(preds["y_pred"].abs().median())
+
+    report = pipeline.run_backtest(df, "ridge", n_splits=3, threshold=threshold)
+    assert report.evaluation.overall["directional_accuracy"] == pytest.approx(
+        directional_accuracy(preds["y_true"], preds["y_pred"], 0.0)
+    )
+    position = report.backtest.frame["position"].to_numpy()
+    np.testing.assert_array_equal(position, (preds["y_pred"] > threshold).astype(float).to_numpy())
+    assert 0 < position.sum() < len(position)
+
+
+def test_da_threshold_does_not_change_positions():
+    df = load_sample_ohlcv()
+    base = pipeline.run_backtest(df, "ridge", n_splits=3)
+    preds = base.evaluation.predictions
+    da_threshold = float(preds["y_true"].abs().median())
+
+    report = pipeline.run_backtest(df, "ridge", n_splits=3, da_threshold=da_threshold)
+    expected = directional_accuracy(preds["y_true"], preds["y_pred"], da_threshold)
+    assert report.evaluation.overall["directional_accuracy"] == pytest.approx(expected)
+    assert expected != pytest.approx(base.evaluation.overall["directional_accuracy"])
+    pd.testing.assert_frame_equal(report.backtest.frame, base.backtest.frame)
+    assert report.backtest.stats == base.backtest.stats
+
+
+def test_backtest_json_reports_both_thresholds(capsys):
+    result = run_json(
+        capsys, "backtest", "--csv", str(SAMPLE_CSV), "--model", "zero", "--splits", "3",
+        "--threshold", "0.001", "--da-threshold", "0.002",
+    )
+    assert result["threshold"] == 0.001
+    assert result["da_threshold"] == 0.002

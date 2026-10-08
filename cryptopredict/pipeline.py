@@ -191,6 +191,7 @@ def run_backtest(
     fee_bps: float = 10.0,
     slippage_bps: float = 0.0,
     threshold: float = 0.0,
+    da_threshold: float = 0.0,
     allow_short: bool = False,
     interval: str | None = None,
     feature_config: FeatureConfig | None = None,
@@ -201,6 +202,10 @@ def run_backtest(
     Folds are separated by ``gap=horizon`` rows so no training target overlaps
     the test period. Positions are held one bar and earn the forward 1-bar log
     return, whatever the forecast horizon.
+
+    ``threshold`` is the minimum ``|forecast|`` to take a position;
+    ``da_threshold`` is the neutral band on ``|y_true|`` excluded from
+    ``directional_accuracy``.
     """
     X, y = dataset if dataset is not None else make_dataset(df, horizon=horizon, config=feature_config)
     columns = list(X.columns)
@@ -210,7 +215,7 @@ def run_backtest(
         y,
         n_splits=n_splits,
         gap=horizon,
-        threshold=threshold,
+        threshold=da_threshold,
     )
     preds = evaluation.predictions
     realized = forward_log_return(df["close"], 1).reindex(preds.index)
