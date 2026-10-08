@@ -146,6 +146,7 @@ def test_fetch_uses_cache_and_writes_csv(tmp_path, monkeypatch, capsys):
     )
     assert calls == [("ETHUSDT", "1h", "2024-01-01", None, tmp_path / "cache")]
     assert result["bars"] == 600 and result["symbol"] == "ETHUSDT"
+    assert result["cache_dir"] == str(tmp_path / "cache")
     pd.testing.assert_frame_equal(data.load_csv(out), load_sample_ohlcv(), check_freq=False)
 
 

@@ -143,6 +143,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         "bars": len(df),
         "start": df.index[0].isoformat() if len(df) else None,
         "end": df.index[-1].isoformat() if len(df) else None,
+        "cache_dir": None if args.csv else str(args.cache_dir),
         "out": str(args.out) if args.out else None,
     }
     text = f"{payload['bars']} bars {payload['start']} .. {payload['end']}"
