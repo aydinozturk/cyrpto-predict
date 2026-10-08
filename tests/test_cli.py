@@ -225,3 +225,79 @@ def test_backtest_json_reports_both_thresholds(capsys):
     )
     assert result["threshold"] == 0.001
     assert result["da_threshold"] == 0.002
+
+
+def _trained(df, **extra):
+    model, info = pipeline.train(df, "ridge")
+    metadata = {"name": model.name, "horizon": info["horizon"], "feature_columns": info["feature_columns"],
+                "feature_config": info["feature_config"], **extra}
+    return model, metadata
+
+
+def test_predict_drops_open_last_bar():
+    df = load_sample_ohlcv()
+    model, metadata = _trained(df, interval="1h")
+    now = df.index[-1] + pd.Timedelta(minutes=20)  # last bar opened 20 min ago, still open
+    with pytest.warns(pipeline.OpenBarWarning):
+        result = pipeline.predict_latest(model, metadata, df, now=now)
+    assert result["as_of"] == df.index[-2].isoformat()
+    assert result["last_close"] == pytest.approx(df["close"].iloc[-2])
+    assert result["dropped_open_bars"] == 1
+
+
+def test_predict_include_open_bar_keeps_old_behaviour(recwarn):
+    df = load_sample_ohlcv()
+    model, metadata = _trained(df, interval="1h")
+    now = df.index[-1] + pd.Timedelta(minutes=20)
+    result = pipeline.predict_latest(model, metadata, df, now=now, include_open_bar=True)
+    assert result["as_of"] == df.index[-1].isoformat()
+    assert result["dropped_open_bars"] == 0
+    assert not [w for w in recwarn if issubclass(w.category, pipeline.OpenBarWarning)]
+
+
+def test_predict_keeps_bar_closing_exactly_now(recwarn):
+    df = load_sample_ohlcv()
+    model, metadata = _trained(df, interval="1h")
+    result = pipeline.predict_latest(model, metadata, df, now=df.index[-1] + pd.Timedelta(hours=1))
+    assert result["as_of"] == df.index[-1].isoformat()
+    assert not [w for w in recwarn if issubclass(w.category, pipeline.OpenBarWarning)]
+
+
+def test_predict_without_interval_assumes_closed_bars():
+    df = load_sample_ohlcv()
+    model, metadata = _trained(df)
+    result = pipeline.predict_latest(model, metadata, df, now=df.index[-1])
+    assert result["as_of"] == df.index[-1].isoformat()
+
+
+def test_drop_open_bars_naive_now_and_all_open():
+    df = load_sample_ohlcv()
+    closed, dropped = pipeline.drop_open_bars(df, "1h", now=df.index[-3].tz_localize(None) + pd.Timedelta(hours=1))
+    assert dropped == 2 and closed.index[-1] == df.index[-3]
+    model, metadata = _trained(df, interval="1h")
+    with pytest.raises(ValueError, match="no closed bars"), pytest.warns(pipeline.OpenBarWarning):
+        pipeline.predict_latest(model, metadata, df, now=df.index[0])
+
+
+def test_cli_predict_skips_open_bar_in_csv(tmp_path, capsys):
+    model_path = tmp_path / "m.joblib"
+    assert cli.main(["train", "--csv", str(SAMPLE_CSV), "--out", str(model_path)]) == 0
+    capsys.readouterr()
+    df = load_sample_ohlcv()
+    current_bar = pd.Timestamp.now(tz="UTC").floor("s") - pd.Timedelta(minutes=1)  # open for 59 more minutes
+    df.index = (df.index + (current_bar - df.index[-1])).rename(df.index.name)
+    live_csv = tmp_path / "live.csv"
+    data.save_csv(df, live_csv)
+
+    assert cli.main(["predict", "--model-path", str(model_path), "--csv", str(live_csv), "--json"]) == 0
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["as_of"] == df.index[-2].isoformat()
+    assert result["dropped_open_bars"] == 1
+    assert "--include-open-bar" in captured.err
+
+    args = ["predict", "--model-path", str(model_path), "--csv", str(live_csv), "--include-open-bar", "--json"]
+    assert cli.main(args) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["as_of"] == df.index[-1].isoformat()
+    assert captured.err == ""

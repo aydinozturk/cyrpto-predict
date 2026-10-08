@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -70,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("predict", help="forecast from the last closed bar with a saved model")
     p.add_argument("--model-path", type=Path, required=True, help="file written by `train` (trusted files only)")
+    p.add_argument("--include-open-bar", action="store_true", help="also use a last bar that has not closed yet")
     _add_data_args(p, default_interval=None)
     _add_json_arg(p)
     p.set_defaults(func=cmd_predict)
@@ -179,7 +181,15 @@ def cmd_predict(args: argparse.Namespace) -> None:
     elif args.interval:
         metadata = {**metadata, "interval": args.interval}
     df = _load(args)
-    result = pipeline.predict_latest(model, metadata, df)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pipeline.OpenBarWarning)
+        result = pipeline.predict_latest(model, metadata, df, include_open_bar=args.include_open_bar)
+    if result["dropped_open_bars"]:
+        print(
+            f"note: ignored {result['dropped_open_bars']} unclosed bar(s) at the end of the data "
+            "(--include-open-bar to use them)",
+            file=sys.stderr,
+        )
     label = " ".join(str(result[k]) for k in ("symbol", "interval") if result.get(k))
     text = "\n".join(
         [

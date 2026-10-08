@@ -73,7 +73,10 @@ cryptopredict train    --csv $CSV --model ridge --horizon 1 --out models/x.jobli
 cryptopredict predict  --csv $CSV --model-path models/x.joblib --json
 ```
 
-`--csv` ile verilen dosyanın son satırı kapanmış mum kabul edilir.
+`predict`, aralık biliniyorsa (`--interval` ya da modelin metadata'sı) henüz
+kapanmamış son mumları (`open_time + aralık > şimdi`) atar ve stderr'e not düşer;
+`--include-open-bar` bu kontrolü kapatır. Aralık bilinmiyorsa `--csv`'deki tüm
+satırlar kapanmış kabul edilir.
 
 ### Komutlar ve bayraklar
 
@@ -93,7 +96,7 @@ cryptopredict predict  --csv $CSV --model-path models/x.joblib --json
 |---|---|---|
 | `fetch` | `--out PATH.csv` | Mumları çeker, önbelleğe (ve isteğe bağlı `--out`'a) yazar, özet basar |
 | `train` | `--model NAME --horizon H --out PATH.joblib` | Tüm veriyle modeli eğitir; model, özellik yapılandırması, sembol/aralık ve eğitim dönemiyle birlikte kaydeder (varsayılan model `ridge`, horizon `1`) |
-| `predict` | `--model-path PATH [--csv PATH]` | Son **kapanmış** mum için tahmini log-getiri, beklenen fiyat, yön (yukarı/aşağı) ve horizon'u basar. `--csv` yoksa modelin metadata'sındaki sembol/aralık için son ~500 bar çekilir (CSV ile eğitilmiş modelde `--symbol` verin) |
+| `predict` | `--model-path PATH [--csv PATH] [--include-open-bar]` | Son **kapanmış** mum için tahmini log-getiri, beklenen fiyat, yön (yukarı/aşağı) ve horizon'u basar. `--csv` yoksa modelin metadata'sındaki sembol/aralık için son ~500 bar çekilir (CSV ile eğitilmiş modelde `--symbol` verin) |
 | `backtest` | `--model NAME\|all --horizon H --splits K --fee-bps F [--slippage-bps S] [--threshold T] [--da-threshold D] [--allow-short]` | Walk-forward kat metrikleri, genel metrikler ve strateji vs. buy-and-hold; `all` ile tüm modelleri RMSE'ye göre sıralı bir tabloda karşılaştırır. Varsayılanlar: `--splits 5`, `--fee-bps 10`, `gap = horizon`. `--threshold` yalnız pozisyon eşiğidir (`\|tahmin\| > T` ise işlem); `--da-threshold` yön isabetindeki nötr banttır (`\|gerçek\| <= D` olan barlar hariç). İkisinin de varsayılanı 0 |
 
 Model adları: `zero`, `mean`, `last`, `ma`, `ridge`, `gbm`.
@@ -102,7 +105,8 @@ Model adları: `zero`, `mean`, `last`, `ma`, `ridge`, `gbm`.
 `as_of` (son kapanmış mumun `open_time`'ı), `target_time` (tahmin edilen
 kapanışın zamanı: `as_of + (horizon + 1) × aralık`), `last_close`,
 `predicted_log_return`, `predicted_pct_change` (yüzde), `expected_price`
-(`last_close * exp(predicted_log_return)`) ve `direction` (`up` / `down` / `flat`).
+(`last_close * exp(predicted_log_return)`), `direction` (`up` / `down` / `flat`) ve
+`dropped_open_bars` (atlanan kapanmamış mum sayısı).
 
 CSV biçimi: `open_time` (UTC zaman damgası) ve `open,high,low,close,volume` kolonları.
 
