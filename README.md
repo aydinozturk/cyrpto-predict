@@ -224,6 +224,13 @@ veriyi kullanır):
 | `volatility_24` | Son 24 barın 1-bar log-getiri standart sapması |
 | `volume_zscore_24` | Hacmin 24 barlık z-skoru (sabit hacimde `0`) |
 | `hour_sin`, `hour_cos`, `dow_sin`, `dow_cos` | Saat / haftanın günü (yalnızca `add_time_features=True` ise) |
+| `atr_14` | Wilder ATR'nin kapanışa oranı (`ATR / close`) |
+| `stoch_k_14`, `stoch_d_14` | Stokastik %K (0–100, düz pencerede `50`) ve 3 barlık ortalaması %D |
+| `obv_zscore_24`, `signed_volume_ratio_24` | OBV'nin 24 barlık z-skoru (ham OBV değil) ve işaretli hacmin toplam hacme oranı (−1…1) |
+| `parkinson_vol_24`, `garman_klass_vol_24` | High/low (ve open/close) aralığından bar başına volatilite tahmini |
+| `candle_body`, `candle_upper_wick`, `candle_lower_wick`, `candle_log_range` | Mum gövdesi (işaretli) ve fitillerin aralığa oranı, `log(high / low)` (`add_candle_features`) |
+| `ret_skew_72`, `ret_kurt_72` | Son 72 barın 1-bar log-getiri çarpıklığı ve fazla basıklığı |
+| `htf_4h_*`, `htf_1d_*` | Üst zaman dilimi: son **kapanmış** üst mumun `log_ret_1`, `log_ret_3`, `rsi_14` ve `close / EMA14 − 1` değerleri |
 
 Kolon adları pencere parametrelerinden türetilir (ör. `rsi_window=21` → `rsi_21`).
 Varsayılanlar `FeatureConfig(...)` ya da kısmi bir sözlükle değiştirilebilir:
@@ -231,15 +238,28 @@ Varsayılanlar `FeatureConfig(...)` ya da kısmi bir sözlükle değiştirilebil
 `FeatureConfig.to_dict()` / `FeatureConfig.from_dict()` yapılandırmayı model
 metadata'sına yazıp tahminde aynı özellikleri yeniden üretmeye yarar.
 
+Üst zaman dilimi (`htf_intervals=("4h", "1d")`): her segment UTC gece yarısına
+hizalı üst mumlara bölünür ve yalnız **tamamı mevcut ve kapanmış** mumlar kullanılır.
+`t` barı, kapanışı (`open_time + htf`) kendi kapanışından (`t + bar`) sonra olmayan son
+üst mumu görür; oluşmakta olan mum asla sızmaz. Bir üst zaman dilimi yalnız
+`bar < htf ≤ htf_max_ratio · bar` (varsayılan 24) ise kullanılır: 1d verisinde hiç,
+15m verisinde yalnız 4h. Günlük göstergeler ısınmayı uzatır: 1h veride segment
+başına ~16 gün (`features.required_history(config, bar)` üst sınırı verir;
+`htf_intervals=()` ile kapatılır).
+
 - `features.build_features(df, config, bar=None)` — tüm özellikler, `df` ile aynı
   indeks; ısınma (warmup) satırları NaN kalır (serinin başında ve her boşluktan sonra).
 - `features.make_dataset(df, horizon, config, bar=None)` → `(X, y)`: ısınma
   satırları, hedefi henüz bilinmeyen son `h` satır ve hedefi bir boşluğu aşan
   satırlar atılır; `X` ve `y` aynı indeksi paylaşır, NaN/sonsuz değer içermez
   (impute yapılmaz).
-- `features.latest_features(df, config, bar=None)` — canlı tahmin için **son barın**
+- `features.latest_features(df, config, bar=None, columns=None)` — canlı tahmin için **son barın**
   özellik satırı. O satır eksikse (yetersiz geçmiş ya da son bar bir boşluktan
   hemen sonra ısınmada) daha eski bir satıra düşmek yerine `ValueError` verir.
+  `columns` verilirse (ör. modelin eğitildiği kolonlar) yalnız onlar döner ve
+  yalnız onların dolu olması gerekir.
+- `features.required_history(config, bar)` — son satırın dolu olması için gereken
+  kesintisiz bar sayısının üst sınırı (canlı tahminde çekilecek geçmiş için).
 - `features.forward_log_return(close, horizon, bar=None)` /
   `features.make_target(df, horizon, bar=None)` — hedef serisi (boşluğu aşan değerler NaN).
 - `features.infer_bar(index)` / `features.segment_ids(index, bar=None)` — bar süresi
