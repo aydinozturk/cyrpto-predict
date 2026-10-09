@@ -11,7 +11,8 @@ model-kesit karşılaştırmasında Holm düzeltmesinden sonra model lehine anla
 sonuç **0**, baseline lehine anlamlı sonuç **98**. Ham `p < 0,05` ile model
 lehine tek bir sonuç var: BTCUSDT 1h h=1 `lgbm_cls`, relative MAE 0,9987,
 `p=0,039`. Bu sonuç Holm sonrası `p=0,156` oluyor ve tek başına bir kanıt
-sayılmamalı.
+sayılmamalı. Kareli kayıpta (MSE) ise aynı model `zero`'dan anlamlı biçimde
+**kötü** (`p=0,020`); yani bu tek işaret kayıp fonksiyonu seçimine bağlı.
 
 10 bps maliyetli long/flat backtest daha da açık: eşiksiz işlem yapan 94
 model-kesitin medyan toplam getirisi %-72,9; buy-and-hold'u geçen yalnız 1 tane
@@ -150,13 +151,43 @@ yapıldı:
   lag seçimine bağlı değil.
 - **Kayıp fonksiyonu:** Kareli kayıpla (`--loss squared`) aynı model `zero`'dan
   anlamlı biçimde **kötü** (stat +2,32, p=0,020). BTCUSDT 4h (+2,22, p=0,026) ve
-  ETHUSDT 4h (+2,10, p=0,036) `lgbm_cls` için de durum aynı. MAE'deki küçük
-  avantaj, büyük hatalardaki kayıpla tersine dönüyor.
+  ETHUSDT 4h (+2,10, p=0,036) `lgbm_cls` için de durum aynı. Olası açıklama
+  (ayrıca test edilmedi): model işareti tutturduğu çok sayıdaki küçük harekette
+  mutlak hatayı biraz düşürüyor, ama kaçırdığı büyük hareketlerde kare hatayı
+  daha çok artırıyor.
 
 Komut: `python scripts/benchmark.py --symbols BTCUSDT --intervals 1h --horizons 1
 --models zero lgbm_cls --loss squared --no-ablation --output data/benchmark/sq.csv`
 (4h için `--symbols BTCUSDT ETHUSDT --intervals 4h`). Bu koşuların Holm aileleri
 yalnız `lgbm_cls`'den oluştuğu için burada ham p verildi.
+
+`benchmark.py`'de lag argümanı yok. Lag değerleri, repo kökünde (tam koşu
+`data/benchmark/cache/`'i doldurduktan sonra) şu snippet'le üretilir. Model
+parametreleri ve seed `benchmark.py` varsayılanlarından alınır:
+
+```python
+import sys
+sys.path.insert(0, "scripts")
+import benchmark as bm
+from cryptopredict.evaluation.stats import diebold_mariano
+from cryptopredict.features import FeatureConfig, make_dataset
+from cryptopredict.pipeline import load_ohlcv, run_backtest
+
+args = bm.parse_args([])
+df = load_ohlcv(symbol="BTCUSDT", interval="1h", start=args.start_1h, end=args.end, cache_dir=args.cache_dir)
+report = run_backtest(
+    df, "lgbm_cls", horizon=1, n_splits=args.splits, fee_bps=args.fee_bps, interval="1h",
+    feature_config=FeatureConfig(), dataset=make_dataset(df, horizon=1, config=FeatureConfig()),
+    model_params=bm._model_params("lgbm_cls", args),
+)
+p = report.evaluation.predictions
+y, e = p["y_true"].to_numpy(), (p["y_true"] - p["y_pred"]).to_numpy()
+nw = int(4 * (len(y) / 100) ** (2 / 9))  # Newey-West otomatik lag: 11
+for lag in (0, nw, 24):
+    r = diebold_mariano(e, y, horizon=1, loss="absolute", max_lag=lag)
+    print(f"lag {lag}: stat={r.statistic:+.3f} p={r.p_value:.3f}")
+# lag 0: -2.064 p=0.039 | lag 11: -2.146 p=0.032 | lag 24: -2.243 p=0.025
+```
 
 ## Model özeti (zengin özellikler, 10 kesit)
 
@@ -300,8 +331,12 @@ değiştirmedi. `gbm`'deki iyileşme daha uzun eğitim verisinden geliyor olabil
 - Deep sonuçları yalnız iki BTC kesiti, varsayılan mimari ve bu CPU için
   geçerli.
 - `zero`, modellerin iç içe (nested) olduğu özel bir durum. Genişleyen pencerede
-  DM bu durumda muhafazakâr olabilir (Clark-McCracken, West). Dolayısıyla
-  "anlamsız" sonuçların bir kısmı düşük güçten gelebilir. Ancak farklar zaten
+  DM bu durumda muhafazakâr olabilir (Clark ve McCracken 2001; Clark ve West
+  2007, kareli kayıp için düzeltilmiş test). Giacomini ve White (2006)
+  çerçevesi tahmin edilmiş parametreli ve iç içe modellerde DM tipi testi
+  geçerli kılar, ama sabit boylu kayan (rolling) pencere ister; burada pencere
+  genişleyen. Dolayısıyla "anlamsız" sonuçların bir kısmı düşük güçten
+  gelebilir. Ancak farklar zaten
   ekonomik olarak çok küçük (relative MAE farkı en çok %0,13).
 - Backtest spread, slippage, fonlama, likidite ve vergi içermez. Gerçek
   uygulama daha kötü olur.
