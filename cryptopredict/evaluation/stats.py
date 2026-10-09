@@ -1,158 +1,204 @@
-"""Statistical comparisons for paired out-of-sample forecasts."""
+"""Forecast-comparison tests: Diebold-Mariano with HAC variance and HLN correction.
+
+Convention: ``d[t] = loss(errors_a[t]) - loss(errors_b[t])``. A negative
+statistic means forecast A has the smaller loss. ``dm_vs_zero`` converts paired
+observations and forecasts to errors against the zero-return baseline.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+import math
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from scipy.stats import t as student_t
+from scipy import stats as scipy_stats
 
-Loss = Literal["absolute", "squared"]
-Kernel = Literal["bartlett", "uniform"]
+LossName = Literal["squared", "absolute"]
+Kernel = Literal["bartlett", "uniform", "rectangular"]
 Alternative = Literal["two-sided", "less", "greater"]
+
+_LOSSES: dict[str, Callable[[np.ndarray], np.ndarray]] = {
+    "squared": np.square,
+    "absolute": np.abs,
+}
 
 
 @dataclass(frozen=True, slots=True)
 class DieboldMarianoResult:
-    """Result of a paired Diebold-Mariano forecast comparison.
-
-    ``mean_loss_diff`` is ``loss(forecast_a) - loss(forecast_b)``. Therefore a
-    negative statistic means that forecast A has the smaller average loss.
-    """
+    """Outcome of :func:`diebold_mariano`."""
 
     statistic: float
     p_value: float
     mean_loss_diff: float
     variance: float
-    n_obs: int
+    n: int
     horizon: int
-    loss: Loss
-    kernel: Kernel
-    alternative: Alternative
+    max_lag: int
+    loss: str
+    kernel: str
+    alternative: str
+    harvey: bool
+
+    @property
+    def n_obs(self) -> int:
+        """Number of paired observations (descriptive alias for ``n``)."""
+        return self.n
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
-def _as_paired_arrays(y_true, forecast_a, forecast_b) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    values = (y_true, forecast_a, forecast_b)
-    series = [value for value in values if isinstance(value, pd.Series)]
-    if series:
-        index = series[0].index
-        if any(not value.index.equals(index) for value in series[1:]):
-            raise ValueError("paired Series must have exactly matching indexes")
-
-    arrays = tuple(np.asarray(value, dtype="float64").ravel() for value in values)
-    lengths = {array.size for array in arrays}
-    if len(lengths) != 1:
-        raise ValueError(
-            "length mismatch: "
-            f"y_true={arrays[0].size}, forecast_a={arrays[1].size}, "
-            f"forecast_b={arrays[2].size}"
-        )
-    if not arrays[0].size:
-        raise ValueError("forecasts must not be empty")
-    if not all(np.isfinite(array).all() for array in arrays):
-        raise ValueError("forecasts and observations must contain only finite values")
-    return arrays
+def _as_array(values, name: str) -> np.ndarray:
+    array = np.asarray(values, dtype="float64").ravel()
+    if not array.size:
+        raise ValueError(f"{name} must not be empty")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must be finite")
+    return array
 
 
-def _loss(error: np.ndarray, kind: Loss) -> np.ndarray:
-    if kind == "absolute":
-        return np.abs(error)
-    if kind == "squared":
-        return np.square(error)
-    raise ValueError("loss must be 'absolute' or 'squared'")
+def long_run_variance(d, max_lag: int, kernel: Kernel = "bartlett") -> float:
+    """HAC long-run variance of the mean-zero version of ``d``.
 
-
-def _long_run_variance(values: np.ndarray, lag: int, kernel: Kernel) -> float:
-    centered = values - values.mean()
-    n_obs = values.size
-    variance = float(centered @ centered / n_obs)
+    ``bartlett`` is the positive-semidefinite Newey-West estimator. ``uniform``
+    (also accepted as ``rectangular``) is the original unweighted DM estimator
+    and can be non-positive in finite samples.
+    """
+    values = _as_array(d, "loss differential")
+    if isinstance(max_lag, bool) or not isinstance(max_lag, (int, np.integer)) or max_lag < 0:
+        raise ValueError(f"max_lag must be a non-negative integer, got {max_lag!r}")
+    if kernel == "rectangular":
+        kernel = "uniform"
     if kernel not in {"bartlett", "uniform"}:
-        raise ValueError("kernel must be 'bartlett' or 'uniform'")
-    for offset in range(1, lag + 1):
-        covariance = float(centered[offset:] @ centered[:-offset] / n_obs)
-        weight = 1.0 - offset / (lag + 1.0) if kernel == "bartlett" else 1.0
-        variance += 2.0 * weight * covariance
+        raise ValueError("kernel must be 'bartlett', 'uniform' or 'rectangular'")
+    centered = values - values.mean()
+    n = values.size
+    variance = float(centered @ centered / n)
+    for lag in range(1, min(int(max_lag), n - 1) + 1):
+        weight = 1.0 - lag / (max_lag + 1.0) if kernel == "bartlett" else 1.0
+        variance += 2.0 * weight * float(centered[lag:] @ centered[:-lag] / n)
     return variance
 
 
 def diebold_mariano(
-    y_true,
-    forecast_a,
-    forecast_b=None,
-    *,
+    errors_a,
+    errors_b,
     horizon: int = 1,
-    loss: Loss = "absolute",
-    kernel: Kernel = "bartlett",
+    loss: LossName | Callable[[np.ndarray], np.ndarray] = "squared",
     alternative: Alternative = "two-sided",
-    small_sample: bool = True,
+    max_lag: int | None = None,
+    kernel: Kernel = "bartlett",
+    harvey: bool = True,
 ) -> DieboldMarianoResult:
-    """Compare two forecasts with a HAC Diebold-Mariano test.
+    """Test equal predictive accuracy for two paired forecast-error series.
 
-    Forecast B defaults to the zero-return forecast. Loss differential is
-    ``L(A) - L(B)``; negative values favour A. Autocovariances through
-    ``horizon - 1`` are included, with a positive-semidefinite Bartlett
-    (Newey-West) kernel by default. ``kernel="uniform"`` selects the original
-    unweighted DM estimator.
+    ``horizon``-step losses use HAC lag ``horizon - 1`` by default. The
+    Bartlett/Newey-West kernel is the safe default; ``kernel="uniform"`` chooses
+    the original DM estimator. With ``harvey=True`` the
+    Harvey-Leybourne-Newbold small-sample correction and Student-t(n-1)
+    reference distribution are used. Otherwise the reference is normal.
 
-    With ``small_sample=True``, the Harvey-Leybourne-Newbold correction is
-    applied and the p-value uses Student's t with ``n - 1`` degrees of freedom.
-    Identical loss series return statistic 0 and p-value 1. Other non-positive
-    HAC variance estimates raise ``ValueError``.
+    Equal loss series return statistic 0 and p-value 1. A different loss series
+    with non-positive HAC variance is undefined and raises ``ValueError``.
     """
+    if isinstance(errors_a, pd.Series) and isinstance(errors_b, pd.Series):
+        if not errors_a.index.equals(errors_b.index):
+            raise ValueError("paired error Series must have exactly matching indexes")
+    a = _as_array(errors_a, "errors_a")
+    b = _as_array(errors_b, "errors_b")
+    if a.shape != b.shape:
+        raise ValueError(f"length mismatch: errors_a={a.size}, errors_b={b.size}")
     if isinstance(horizon, bool) or not isinstance(horizon, (int, np.integer)) or horizon < 1:
         raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
+    n = a.size
+    if n < 2 * horizon + 1:
+        raise ValueError(f"need at least {2 * horizon + 1} errors for horizon {horizon}, got {n}")
     if alternative not in {"two-sided", "less", "greater"}:
         raise ValueError("alternative must be 'two-sided', 'less' or 'greater'")
-    if forecast_b is None:
-        forecast_b = np.zeros_like(np.asarray(forecast_a, dtype="float64"))
-    actual, first, second = _as_paired_arrays(y_true, forecast_a, forecast_b)
-    n_obs = actual.size
-    if n_obs <= horizon:
-        raise ValueError(f"need more observations than horizon; got n={n_obs}, horizon={horizon}")
-
-    differential = _loss(actual - first, loss) - _loss(actual - second, loss)
-    mean = float(differential.mean())
-    if np.allclose(differential, 0.0, rtol=0.0, atol=np.finfo("float64").eps):
-        return DieboldMarianoResult(
-            0.0, 1.0, 0.0, 0.0, n_obs, int(horizon), loss, kernel, alternative
-        )
-
-    long_run_variance = _long_run_variance(differential, int(horizon) - 1, kernel)
-    tolerance = np.finfo("float64").eps * max(1.0, float(np.mean(differential**2)))
-    if not np.isfinite(long_run_variance) or long_run_variance <= tolerance:
-        raise ValueError(
-            "loss differential has a non-positive HAC variance; "
-            "the Diebold-Mariano statistic is undefined"
-        )
-
-    statistic = mean / np.sqrt(long_run_variance / n_obs)
-    if small_sample:
-        correction_sq = (
-            n_obs + 1.0 - 2.0 * horizon + horizon * (horizon - 1.0) / n_obs
-        ) / n_obs
-        if correction_sq <= 0.0:
-            raise ValueError(f"HLN correction is undefined for n={n_obs}, horizon={horizon}")
-        statistic *= np.sqrt(correction_sq)
-
-    cdf = float(student_t.cdf(statistic, df=n_obs - 1))
-    if alternative == "less":
-        p_value = cdf
-    elif alternative == "greater":
-        p_value = 1.0 - cdf
+    if callable(loss):
+        loss_fn, loss_name = loss, getattr(loss, "__name__", "custom")
+    elif loss in _LOSSES:
+        loss_fn, loss_name = _LOSSES[loss], loss
     else:
-        p_value = 2.0 * min(cdf, 1.0 - cdf)
+        raise ValueError("loss must be 'squared', 'absolute' or a callable")
+    if max_lag is None:
+        lags = int(horizon) - 1
+    elif isinstance(max_lag, bool) or not isinstance(max_lag, (int, np.integer)) or max_lag < 0:
+        raise ValueError(f"max_lag must be a non-negative integer, got {max_lag!r}")
+    else:
+        lags = int(max_lag)
+
+    differential = np.asarray(loss_fn(a), dtype="float64") - np.asarray(loss_fn(b), dtype="float64")
+    if differential.shape != a.shape or not np.isfinite(differential).all():
+        raise ValueError("loss must return one finite value per error")
+    mean = float(differential.mean())
+    normalized_kernel = "uniform" if kernel == "rectangular" else kernel
+    lrv = long_run_variance(differential, lags, kernel)
+    if np.allclose(differential, 0.0, rtol=0.0, atol=np.finfo("float64").eps):
+        statistic, p_value, variance = 0.0, 1.0, 0.0
+    else:
+        tolerance = np.finfo("float64").eps * max(1.0, float(np.mean(differential**2)))
+        if not np.isfinite(lrv) or lrv <= tolerance:
+            raise ValueError(
+                "loss differential has a non-positive HAC variance; "
+                "the Diebold-Mariano statistic is undefined"
+            )
+        variance = lrv / n
+        statistic = mean / math.sqrt(variance)
+        if harvey:
+            correction_sq = (n + 1.0 - 2.0 * horizon + horizon * (horizon - 1.0) / n) / n
+            if correction_sq <= 0.0:
+                raise ValueError(f"HLN correction is undefined for n={n}, horizon={horizon}")
+            statistic *= math.sqrt(correction_sq)
+        distribution = scipy_stats.t(df=n - 1) if harvey else scipy_stats.norm()
+        if alternative == "two-sided":
+            p_value = 2.0 * float(distribution.sf(abs(statistic)))
+        elif alternative == "less":
+            p_value = float(distribution.cdf(statistic))
+        else:
+            p_value = float(distribution.sf(statistic))
+
     return DieboldMarianoResult(
         statistic=float(statistic),
         p_value=float(np.clip(p_value, 0.0, 1.0)),
         mean_loss_diff=mean,
-        variance=float(long_run_variance / n_obs),
-        n_obs=n_obs,
+        variance=float(variance),
+        n=n,
         horizon=int(horizon),
-        loss=loss,
-        kernel=kernel,
+        max_lag=lags,
+        loss=loss_name,
+        kernel=normalized_kernel,
         alternative=alternative,
+        harvey=harvey,
+    )
+
+
+def dm_vs_zero(
+    y_true,
+    y_pred,
+    horizon: int = 1,
+    loss: LossName = "squared",
+    alternative: Alternative = "less",
+    **kwargs: Any,
+) -> DieboldMarianoResult:
+    """Compare a forecast with zero return on exactly paired observations."""
+    if isinstance(y_true, pd.Series) and isinstance(y_pred, pd.Series):
+        if not y_true.index.equals(y_pred.index):
+            raise ValueError("paired Series must have exactly matching indexes")
+    actual = _as_array(y_true, "y_true")
+    predicted = _as_array(y_pred, "y_pred")
+    if actual.shape != predicted.shape:
+        raise ValueError(f"length mismatch: y_true={actual.size}, y_pred={predicted.size}")
+    return diebold_mariano(
+        actual - predicted,
+        actual,
+        horizon=horizon,
+        loss=loss,
+        alternative=alternative,
+        **kwargs,
     )
 
 

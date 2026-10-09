@@ -10,7 +10,13 @@ from .metrics import (
     smape,
 )
 from .splits import walk_forward_splits
-from .stats import DieboldMarianoResult, diebold_mariano, diebold_mariano_test
+from .stats import (
+    DieboldMarianoResult,
+    diebold_mariano,
+    diebold_mariano_test,
+    dm_vs_zero,
+    long_run_variance,
+)
 from .walkforward import WalkForwardResult, walk_forward_evaluate
 
 __all__ = [
@@ -21,6 +27,8 @@ __all__ = [
     "directional_accuracy",
     "diebold_mariano",
     "diebold_mariano_test",
+    "dm_vs_zero",
+    "long_run_variance",
     "mae",
     "regression_report",
     "relative_mae",

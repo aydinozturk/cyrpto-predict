@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from cryptopredict.evaluation import backtest, diebold_mariano
+from cryptopredict.evaluation import backtest, dm_vs_zero
 from cryptopredict.features import FeatureConfig, forward_log_return, make_dataset
 from cryptopredict.models import available_models
 from cryptopredict.pipeline import load_ohlcv, periods_per_year, run_backtest
@@ -181,9 +181,9 @@ def _evaluate(
             model_params=_model_params(model, args),
         )
         predictions = report.evaluation.predictions
-        dm = diebold_mariano(
+        dm = dm_vs_zero(
             predictions["y_true"], predictions["y_pred"], horizon=horizon,
-            loss=args.loss, kernel=args.hac_kernel,
+            loss=args.loss, alternative="two-sided", kernel=args.hac_kernel,
         )
         row.update(report.evaluation.overall)
         backtest_stats = dict(report.backtest.stats)
