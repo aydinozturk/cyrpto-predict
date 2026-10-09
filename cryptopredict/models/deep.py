@@ -87,18 +87,21 @@ class _SequenceForecaster(BaselineForecaster):
     Training: features are standardized and the target is z-scored with
     statistics of the training rows only.  The chronologically last
     ``validation_fraction`` of the windows is held out for early stopping (Huber
-    loss, AdamW); training stops after ``patience`` epochs without improvement,
+    loss, AdamW), while always leaving at least one window for optimization.  A
+    single available window has no validation holdout and is monitored on its
+    training loss.  Training stops after ``patience`` epochs without improvement,
     ``max_epochs`` or ``max_train_seconds``, and keeps the best epoch's weights.
 
     ``predict(X)`` returns one value per row of ``X`` and only looks back.  The
     first ``lookback - 1`` rows lack a full window inside ``X``; they are
     completed with the last ``lookback - 1`` training rows when ``X`` starts after
     the training data and within ``lookback`` steps of it (as in walk-forward
-    folds; the skipped rows of a fold gap are simply absent from the window).
-    Otherwise (and after a gap inside ``X``) the window is left-padded by
-    repeating its first row.  Rows ``lookback - 1`` and later of a contiguous
-    ``X`` use windows made of ``X`` alone, so passing the last ``lookback`` rows
-    is enough for a live forecast.
+    folds).  Bridging that boundary is intentional: skipped fold-gap rows are
+    neither synthesized nor read, so the sequence may omit time steps but never
+    looks ahead.  Otherwise (and after a gap inside ``X``) the window is
+    left-padded by repeating its first row.  Rows ``lookback - 1`` and later of a
+    contiguous ``X`` use windows made of ``X`` alone, so passing the last
+    ``lookback`` rows is enough for a live forecast.
     """
 
     heavy = True
@@ -193,43 +196,52 @@ class _SequenceForecaster(BaselineForecaster):
         windows = np.stack([scaled[end - lookback + 1 : end + 1] for end in endpoints])
         targets = targets[endpoints]
 
-        n_validation = int(np.ceil(len(windows) * self.validation_fraction)) if len(windows) > 1 else 0
+        n_validation = (
+            min(int(np.ceil(len(windows) * self.validation_fraction)), len(windows) - 1)
+            if len(windows) > 1
+            else 0
+        )
         split = len(windows) - n_validation
         train_x, train_y = torch.from_numpy(windows[:split]), torch.from_numpy(targets[:split])
         val_x, val_y = torch.from_numpy(windows[split:]), torch.from_numpy(targets[split:])
         monitor_x, monitor_y = (val_x, val_y) if n_validation else (train_x, train_y)
 
-        network = self._network(raw.shape[1])
-        optimizer = torch.optim.AdamW(
-            network.parameters(), lr=float(self.learning_rate), weight_decay=float(self.weight_decay)
-        )
-        loss_function = nn.HuberLoss()
-        generator = torch.Generator().manual_seed(int(self.random_state))
-        best_loss, best_state, stale = float("inf"), copy.deepcopy(network.state_dict()), 0
-        started = time.monotonic()
-        out_of_time = False
-        self.n_epochs_ = 0
-        for epoch in range(int(self.max_epochs)):
-            network.train()
-            order = torch.randperm(len(train_x), generator=generator)
-            for offset in range(0, len(order), int(self.batch_size)):
-                batch = order[offset : offset + int(self.batch_size)]
-                optimizer.zero_grad(set_to_none=True)
-                loss_function(network(train_x[batch]), train_y[batch]).backward()
-                optimizer.step()
-                if time.monotonic() - started >= self.max_train_seconds:
-                    out_of_time = True
+        # Recurrent dropout consumes the global CPU RNG.  Fork it for the whole
+        # optimization so random_state controls every stochastic operation while
+        # callers observe exactly the same RNG state before and after fit.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(self.random_state))
+            network = self._network(raw.shape[1])
+            optimizer = torch.optim.AdamW(
+                network.parameters(), lr=float(self.learning_rate), weight_decay=float(self.weight_decay)
+            )
+            loss_function = nn.HuberLoss()
+            generator = torch.Generator().manual_seed(int(self.random_state))
+            best_loss, best_state, stale = float("inf"), copy.deepcopy(network.state_dict()), 0
+            started = time.monotonic()
+            out_of_time = False
+            self.n_epochs_ = 0
+            for epoch in range(int(self.max_epochs)):
+                network.train()
+                order = torch.randperm(len(train_x), generator=generator)
+                for offset in range(0, len(order), int(self.batch_size)):
+                    batch = order[offset : offset + int(self.batch_size)]
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_function(network(train_x[batch]), train_y[batch]).backward()
+                    optimizer.step()
+                    if time.monotonic() - started >= self.max_train_seconds:
+                        out_of_time = True
+                        break
+                network.eval()
+                with torch.no_grad():
+                    monitored = float(loss_function(network(monitor_x), monitor_y))
+                self.n_epochs_ = epoch + 1
+                if monitored < best_loss - 1e-8:
+                    best_loss, best_state, stale = monitored, copy.deepcopy(network.state_dict()), 0
+                else:
+                    stale += 1
+                if stale >= self.patience or out_of_time:
                     break
-            network.eval()
-            with torch.no_grad():
-                monitored = float(loss_function(network(monitor_x), monitor_y))
-            self.n_epochs_ = epoch + 1
-            if monitored < best_loss - 1e-8:
-                best_loss, best_state, stale = monitored, copy.deepcopy(network.state_dict()), 0
-            else:
-                stale += 1
-            if stale >= self.patience or out_of_time:
-                break
 
         network.load_state_dict(best_state)
         network.eval()
