@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 from sklearn.base import clone
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from cryptopredict.evaluation import walk_forward_evaluate  # noqa: E402
 from cryptopredict.models import load_model, save_model  # noqa: E402
@@ -45,6 +45,32 @@ def test_same_seed_gives_identical_predictions(fitted):
     model, X, y = fitted
     again = type(model)(**FAST).fit(X.iloc[:700], y.iloc[:700])
     np.testing.assert_array_equal(again.predict(X.iloc[700:]), model.predict(X.iloc[700:]))
+
+
+def test_dropout_is_deterministic_without_changing_global_torch_rng():
+    X, y = _sine(50)
+    params = {
+        "lookback": 6,
+        "hidden_size": 4,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "batch_size": 16,
+        "max_epochs": 2,
+        "patience": 2,
+        "max_train_seconds": 20.0,
+        "random_state": 42,
+    }
+
+    torch.manual_seed(1)
+    state_before_first = torch.random.get_rng_state().clone()
+    first = LSTMForecaster(**params).fit(X, y)
+    assert torch.equal(torch.random.get_rng_state(), state_before_first)
+
+    torch.manual_seed(999)
+    state_before_second = torch.random.get_rng_state().clone()
+    second = LSTMForecaster(**params).fit(X, y)
+    assert torch.equal(torch.random.get_rng_state(), state_before_second)
+    np.testing.assert_array_equal(first.predict(X), second.predict(X))
 
 
 def test_predictions_never_look_ahead(fitted):
@@ -113,6 +139,30 @@ def test_invalid_hyperparameters_are_rejected():
             LSTMForecaster(**params).fit(X, y)
     with pytest.raises(ValueError, match="not fitted"):
         GRUForecaster().predict(X)
+
+
+def test_validation_split_always_leaves_a_training_window(monkeypatch):
+    X, y = _sine(5)
+    optimizer_steps = 0
+    original_step = torch.optim.AdamW.step
+
+    def counted_step(optimizer, closure=None):
+        nonlocal optimizer_steps
+        optimizer_steps += 1
+        return original_step(optimizer, closure)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", counted_step)
+    model = LSTMForecaster(
+        lookback=4,
+        hidden_size=4,
+        validation_fraction=0.9,
+        max_epochs=1,
+        patience=1,
+        max_train_seconds=20.0,
+    ).fit(X, y)
+
+    assert optimizer_steps == 1
+    assert model.n_epochs_ == 1
 
 
 def test_default_fit_on_2000_rows_is_fast_and_time_budget_holds():
