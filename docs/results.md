@@ -132,12 +132,31 @@ isabet sayılmaz.
 | Test (model × kesit) | 94 | 30 | 124 |
 | Negatif DM istatistiği (model lehine yön) | 4 | 0 | 4 |
 | Ham p < 0,05, model lehine | 1 | 0 | 1 |
-| Holm p < 0,05, model lehine | 0 | 0 | 0 |
-| Holm p < 0,05, baseline lehine | 70 | 28 | 98 |
+| Aile içi Holm p < 0,05, model lehine | 0 | 0 | 0 |
+| Aile içi Holm p < 0,05, baseline lehine | 70 | 28 | 98 |
 
-Aile bazlı ayrıntı (`models`, `raw_better`, `holm_better`, `holm_worse`,
-`min_p_better`) `final.md`'deki "DM test against zero per Holm family"
-tablosundadır.
+Holm, hata oranını 20 ailenin her birinin içinde kontrol eder; 124 testin
+tamamı üzerinde global bir kontrol değildir. Model lehine 0 sonuç, global bir
+düzeltmede de değişmez. Aile bazlı ayrıntı (`models`, `raw_better`,
+`holm_better`, `holm_worse`, `min_p_better`) `final.md`'deki "DM test against
+zero per Holm family" tablosundadır.
+
+Tek ham anlamlı sonuç (BTC 1h h=1 `lgbm_cls`) için iki duyarlılık kontrolü
+yapıldı:
+
+- **HAC lag:** Aynı OOS tahminlerde `diebold_mariano(..., max_lag=L)` ile
+  Newey-West otomatik lag (L=11) p=0,032, L=24 p=0,025 veriyor.
+  Aile içi Holm sonrası (bu p ailede 8. sırada, çarpan 4) yine ≥ 0,10. Sonuç
+  lag seçimine bağlı değil.
+- **Kayıp fonksiyonu:** Kareli kayıpla (`--loss squared`) aynı model `zero`'dan
+  anlamlı biçimde **kötü** (stat +2,32, p=0,020). BTCUSDT 4h (+2,22, p=0,026) ve
+  ETHUSDT 4h (+2,10, p=0,036) `lgbm_cls` için de durum aynı. MAE'deki küçük
+  avantaj, büyük hatalardaki kayıpla tersine dönüyor.
+
+Komut: `python scripts/benchmark.py --symbols BTCUSDT --intervals 1h --horizons 1
+--models zero lgbm_cls --loss squared --no-ablation --output data/benchmark/sq.csv`
+(4h için `--symbols BTCUSDT ETHUSDT --intervals 4h`). Bu koşuların Holm aileleri
+yalnız `lgbm_cls`'den oluştuğu için burada ham p verildi.
 
 ## Model özeti (zengin özellikler, 10 kesit)
 
@@ -280,6 +299,10 @@ değiştirmedi. `gbm`'deki iyileşme daha uzun eğitim verisinden geliyor olabil
   Eşik duyarlılığı post-hoc ve betimsel.
 - Deep sonuçları yalnız iki BTC kesiti, varsayılan mimari ve bu CPU için
   geçerli.
+- `zero`, modellerin iç içe (nested) olduğu özel bir durum. Genişleyen pencerede
+  DM bu durumda muhafazakâr olabilir (Clark-McCracken, West). Dolayısıyla
+  "anlamsız" sonuçların bir kısmı düşük güçten gelebilir. Ancak farklar zaten
+  ekonomik olarak çok küçük (relative MAE farkı en çok %0,13).
 - Backtest spread, slippage, fonlama, likidite ve vergi içermez. Gerçek
   uygulama daha kötü olur.
 
