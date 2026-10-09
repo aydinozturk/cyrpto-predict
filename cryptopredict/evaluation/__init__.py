@@ -10,13 +10,17 @@ from .metrics import (
     smape,
 )
 from .splits import walk_forward_splits
+from .stats import DieboldMarianoResult, diebold_mariano, diebold_mariano_test
 from .walkforward import WalkForwardResult, walk_forward_evaluate
 
 __all__ = [
     "BacktestResult",
+    "DieboldMarianoResult",
     "WalkForwardResult",
     "backtest",
     "directional_accuracy",
+    "diebold_mariano",
+    "diebold_mariano_test",
     "mae",
     "regression_report",
     "relative_mae",
