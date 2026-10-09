@@ -149,3 +149,38 @@ def test_nonpositive_nonconstant_hac_variance_is_rejected():
     second = np.array([1.0, 0.0] * 10)
     with pytest.raises(ValueError, match="non-positive HAC variance"):
         diebold_mariano(first, second, horizon=2, loss="absolute", kernel="uniform")
+
+
+@pytest.mark.parametrize("factor", [1e-3, 1e-6, 1e-12, 1e3])
+def test_statistic_is_scale_free(factor):
+    rng = np.random.default_rng(11)
+    actual = rng.normal(0.0, 1.0, 400)
+    errors_a = actual - rng.normal(0.0, 0.2, 400)
+    errors_b = actual - rng.normal(0.0, 0.25, 400)
+
+    base = diebold_mariano(errors_a, errors_b, horizon=3)
+    scaled = diebold_mariano(errors_a * factor, errors_b * factor, horizon=3)
+
+    assert scaled.statistic == pytest.approx(base.statistic, rel=1e-9)
+    assert scaled.p_value == pytest.approx(base.p_value, rel=1e-9)
+    assert scaled.variance == pytest.approx(base.variance * factor**4, rel=1e-9)
+
+
+def test_dm_vs_zero_handles_tiny_returns_and_predictions():
+    # 1h-like returns with a heavily shrunk model: the differential is ~1e-11.
+    rng = np.random.default_rng(5)
+    actual = rng.normal(0.0, 5e-3, 1000)
+    predicted = 1e-6 * rng.standard_normal(1000)
+
+    result = dm_vs_zero(actual, predicted, horizon=4)
+    rescaled = dm_vs_zero(actual * 1e3, predicted * 1e3, horizon=4)
+
+    assert np.isfinite(result.statistic) and 0.0 <= result.p_value <= 1.0
+    assert result.statistic == pytest.approx(rescaled.statistic, rel=1e-9)
+
+
+def test_tiny_but_nonzero_differential_is_not_treated_as_equal():
+    errors_a = np.linspace(-1.0, 1.0, 50) * 1e-20
+    errors_b = errors_a * 1.5
+    result = diebold_mariano(errors_a, errors_b, loss="absolute")
+    assert result.statistic < 0 and result.p_value < 0.05

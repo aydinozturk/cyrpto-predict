@@ -101,8 +101,14 @@ def diebold_mariano(
     Harvey-Leybourne-Newbold small-sample correction and Student-t(n-1)
     reference distribution are used. Otherwise the reference is normal.
 
-    Equal loss series return statistic 0 and p-value 1. A different loss series
-    with non-positive HAC variance is undefined and raises ``ValueError``.
+    The HLN factor was derived for the uniform kernel with ``horizon - 1``
+    lags; combined with the Bartlett default it is the usual small-sample
+    approximation rather than an exact correction.
+
+    The test is scale-free: rescaling both error series gives the same
+    statistic. Equal loss series return statistic 0 and p-value 1. A different
+    loss series whose HAC variance is non-positive relative to ``mean(d**2)``
+    is undefined and raises ``ValueError``.
     """
     if isinstance(errors_a, pd.Series) and isinstance(errors_b, pd.Series):
         if not errors_a.index.equals(errors_b.index):
@@ -136,18 +142,21 @@ def diebold_mariano(
         raise ValueError("loss must return one finite value per error")
     mean = float(differential.mean())
     normalized_kernel = "uniform" if kernel == "rectangular" else kernel
-    lrv = long_run_variance(differential, lags, kernel)
-    if np.allclose(differential, 0.0, rtol=0.0, atol=np.finfo("float64").eps):
+    # Work on d / max|d| so the tolerance is relative and tiny losses cannot underflow.
+    scale = float(np.max(np.abs(differential)))
+    if scale == 0.0:
         statistic, p_value, variance = 0.0, 1.0, 0.0
     else:
-        tolerance = np.finfo("float64").eps * max(1.0, float(np.mean(differential**2)))
+        unit = differential / scale
+        lrv = long_run_variance(unit, lags, kernel)
+        tolerance = 64.0 * np.finfo("float64").eps * float(np.mean(unit**2))
         if not np.isfinite(lrv) or lrv <= tolerance:
             raise ValueError(
                 "loss differential has a non-positive HAC variance; "
                 "the Diebold-Mariano statistic is undefined"
             )
-        variance = lrv / n
-        statistic = mean / math.sqrt(variance)
+        variance = lrv / n * scale * scale
+        statistic = float(unit.mean()) / math.sqrt(lrv / n)
         if harvey:
             correction_sq = (n + 1.0 - 2.0 * horizon + horizon * (horizon - 1.0) / n) / n
             if correction_sq <= 0.0:
