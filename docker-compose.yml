@@ -6,7 +6,12 @@
 services:
   dashboard:
     image: ${CRYPTOPREDICT_IMAGE:-ghcr.io/aydinozturk/cyrpto-predict:latest}
-    build: .
+    build:
+      context: .
+      args:
+        # optional dependency groups baked into a local build; add `deep` for
+        # the LSTM/GRU models (CPU PyTorch). The published image uses web,ml.
+        EXTRAS: ${CRYPTOPREDICT_EXTRAS:-web,ml}
     env_file:
       - path: .env
         required: false

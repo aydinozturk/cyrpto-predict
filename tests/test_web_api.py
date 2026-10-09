@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cryptopredict import data
+from cryptopredict.models import ZeroReturn, registry
 from cryptopredict.web.app import create_app
 from cryptopredict.web.jobs import json_safe
 from cryptopredict.web.settings import Settings
@@ -130,7 +131,9 @@ def test_train_predict_backtest_models_jobs_and_delete(tmp_path):
             "/api/backtest",
             {"symbol": "BTCUSDT", "interval": "1h", "model": "all", "splits": 3},
         )
-        assert len(comparison["result"]["table"]) == len(client.get("/api/config").json()["models"])
+        config = client.get("/api/config").json()
+        quick = set(config["models"]) - set(config["heavy_models"])
+        assert {row["model"] for row in comparison["result"]["table"]} == quick
         assert json_safe({"metric": float("nan"), "nested": [float("inf")]}) == {
             "metric": None,
             "nested": [None],
@@ -194,3 +197,58 @@ def test_train_without_start_or_cache_is_rejected_before_queueing(tmp_path):
         )
         assert response.status_code == 400
         assert client.get("/api/jobs").json() == []
+
+
+class SlowZero(ZeroReturn):
+    """Stand-in for a heavy sequence model."""
+
+    name = "slow_zero"
+    heavy = True
+
+
+def test_params_are_validated_and_saved(tmp_path):
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        trained = _submit(
+            client,
+            "/api/train",
+            {"symbol": "BTCUSDT", "interval": "1h", "model": "ridge", "name": "r", "params": {"alpha": 100}},
+        )
+        assert trained["params"]["params"] == {"alpha": 100}
+        assert trained["result"]["model_params"] == {"alpha": 100}
+        assert client.get("/api/models").json()[0]["model_params"] == {"alpha": 100}
+
+        stacked = _submit(
+            client,
+            "/api/backtest",
+            {
+                "symbol": "BTCUSDT", "interval": "1h", "model": "stack", "splits": 2, "horizon": 2,
+                "params": {"members": ["zero", "ridge"]},
+            },
+        )
+        assert stacked["result"]["model_params"] == {"members": ["zero", "ridge"], "gap": 2}
+
+        bad = client.post(
+            "/api/train",
+            json={"symbol": "BTCUSDT", "interval": "1h", "model": "ridge", "params": {"bogus": 1}},
+        )
+        assert bad.status_code == 400 and "invalid parameters" in bad.json()["detail"]
+        bad = client.post(
+            "/api/backtest",
+            json={"symbol": "BTCUSDT", "interval": "1h", "model": "all", "params": {"alpha": 1}},
+        )
+        assert bad.status_code == 400
+        assert len(client.get("/api/jobs").json()) == 2
+
+
+def test_heavy_models_are_listed_and_opt_in_for_all(tmp_path, monkeypatch):
+    monkeypatch.setitem(registry.LAZY_MODELS, "slow_zero", f"{__name__}:SlowZero")
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        config = client.get("/api/config").json()
+        assert "slow_zero" in config["models"] and "slow_zero" in config["heavy_models"]
+        assert "ridge" not in config["heavy_models"]
+
+        payload = {"symbol": "BTCUSDT", "interval": "1h", "model": "all", "splits": 2}
+        quick = _submit(client, "/api/backtest", payload)
+        assert "slow_zero" not in {row["model"] for row in quick["result"]["table"]}
+        full = _submit(client, "/api/backtest", {**payload, "include_heavy": True})
+        assert "slow_zero" in {row["model"] for row in full["result"]["table"]}

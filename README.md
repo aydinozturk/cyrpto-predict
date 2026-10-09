@@ -44,6 +44,16 @@ pip install -e ".[dev]"
 ```
 
 Bağımlılıklar: pandas, numpy, scikit-learn, requests, joblib (geliştirme için pytest).
+Opsiyonel gruplar (extras):
+
+| Extra | Ne ekler | Kurulum |
+|---|---|---|
+| `ml` | LightGBM: `lgbm`, `lgbm_cls`, `ensemble`/`stack`'in varsayılan üyesi | `pip install -e ".[dev,ml]"` |
+| `web` | FastAPI paneli (`cryptopredict-web`) | `pip install -e ".[dev,web,ml]"` |
+| `deep` | PyTorch: `lstm`, `gru` (ağır) | önce CPU torch: `pip install torch --index-url https://download.pytorch.org/whl/cpu`, sonra `pip install -e ".[dev,ml,deep]"` |
+
+Bağımlılığı kurulu olmayan model `available_models()` listesinde ve CLI
+seçeneklerinde görünmez.
 Kurulumdan sonra `cryptopredict` komutu kullanılabilir (`python -m cryptopredict` ile aynı).
 
 ## Hızlı başlangıç (CLI)
@@ -62,6 +72,12 @@ cryptopredict predict --model-path models/btc_ridge.joblib
 # 4) Walk-forward değerlendirme + backtest (tüm modelleri karşılaştır)
 cryptopredict backtest --symbol BTCUSDT --interval 1h --start 2024-01-01 \
     --model all --splits 5 --fee-bps 10
+
+# 5) Hiperparametre araması (nested walk-forward), sonra önerilen parametrelerle eğit
+cryptopredict tune --symbol BTCUSDT --interval 1h --start 2024-01-01 \
+    --model lgbm --n-trials 20 --time-budget 60   # saniye, arama başına (5 kat + final)
+cryptopredict train --symbol BTCUSDT --interval 1h --start 2024-01-01 \
+    --model lgbm --param n_estimators=300 --param learning_rate=0.03 --out models/btc_lgbm.joblib
 ```
 
 Ağ erişimi olmadan denemek için her komut `--csv PATH` ile yerel bir OHLCV
@@ -72,6 +88,7 @@ CSV=tests/fixtures/btcusdt_1h_sample.csv
 cryptopredict backtest --csv $CSV --model all --splits 5
 cryptopredict train    --csv $CSV --model ridge --horizon 1 --out models/x.joblib
 cryptopredict predict  --csv $CSV --model-path models/x.joblib --json
+cryptopredict tune     --csv $CSV --model ridge --splits 3 --n-trials 5
 ```
 
 `predict`, aralık biliniyorsa (`--interval` ya da modelin metadata'sı) henüz
@@ -81,7 +98,7 @@ satırlar kapanmış kabul edilir.
 
 ### Komutlar ve bayraklar
 
-**Ortak veri bayrakları** (`fetch`, `train`, `predict`, `backtest`):
+**Ortak veri bayrakları** (`fetch`, `train`, `predict`, `backtest`, `tune`):
 
 | Bayrak | Açıklama |
 |---|---|
@@ -96,11 +113,14 @@ satırlar kapanmış kabul edilir.
 | Komut | Ek bayraklar | Ne yapar |
 |---|---|---|
 | `fetch` | `--out PATH.csv` | Mumları çeker, önbelleğe (ve isteğe bağlı `--out`'a) yazar, özet basar |
-| `train` | `--model NAME --horizon H --out PATH.joblib` | Tüm veriyle modeli eğitir; model, özellik yapılandırması, sembol/aralık ve eğitim dönemiyle birlikte kaydeder (varsayılan model `ridge`, horizon `1`) |
-| `predict` | `--model-path PATH [--csv PATH] [--include-open-bar]` | Son **kapanmış** mum için tahmini log-getiri, beklenen fiyat, yön (yukarı/aşağı) ve horizon'u basar. `--csv` yoksa modelin metadata'sındaki sembol/aralık için son ~500 bar çekilir (CSV ile eğitilmiş modelde `--symbol` verin) |
-| `backtest` | `--model NAME\|all --horizon H --splits K --fee-bps F [--slippage-bps S] [--threshold T] [--da-threshold D] [--allow-short]` | Walk-forward kat metrikleri, genel metrikler ve strateji vs. buy-and-hold; `all` ile tüm modelleri RMSE'ye göre sıralı bir tabloda karşılaştırır. Varsayılanlar: `--splits 5`, `--fee-bps 10`, `gap = horizon`. `--threshold` yalnız pozisyon eşiğidir (`\|tahmin\| > T` ise işlem); `--da-threshold` yön isabetindeki nötr banttır (`\|gerçek\| <= D` olan barlar hariç). İkisinin de varsayılanı 0 |
+| `train` | `--model NAME --horizon H --out PATH.joblib [--param K=V ...]` | Tüm veriyle modeli eğitir; model, parametreleri (`model_params`), özellik yapılandırması, sembol/aralık ve eğitim dönemiyle birlikte kaydeder (varsayılan model `ridge`, horizon `1`) |
+| `predict` | `--model-path PATH [--csv PATH] [--include-open-bar]` | Son **kapanmış** mum için tahmini log-getiri, beklenen fiyat, yön (yukarı/aşağı) ve horizon'u basar. `--csv` yoksa modelin metadata'sındaki sembol/aralık için yeterli geçmiş çekilir: özellik ısınması (`required_history`) + modelin `lookback`'i + 50 bar pay, en az 500 bar (CSV ile eğitilmiş modelde `--symbol` verin) |
+| `backtest` | `--model NAME\|all --horizon H --splits K --fee-bps F [--slippage-bps S] [--threshold T] [--da-threshold D] [--allow-short] [--include-heavy] [--param K=V ...]` | Walk-forward kat metrikleri, genel metrikler ve strateji vs. buy-and-hold; `all` ile modelleri RMSE'ye göre sıralı bir tabloda karşılaştırır (ağır modeller yalnız `--include-heavy` ile). Varsayılanlar: `--splits 5`, `--fee-bps 10`, `gap = horizon`. `--threshold` yalnız pozisyon eşiğidir (`\|tahmin\| > T` ise işlem); `--da-threshold` yön isabetindeki nötr banttır (`\|gerçek\| <= D` olan barlar hariç). İkisinin de varsayılanı 0. `--param` yalnız tek modelle kullanılır |
+| `tune` | `--model NAME --horizon H --splits K [--inner-splits I] [--n-trials N] [--time-budget SN] [--metric mae] [--seed 42] [--param K=V ...] [--space K=[...] ...]` | Nested walk-forward hiperparametre araması: her dış kat yalnız kendi eğitim satırlarında aranır, test katı bir kez skorlanır (dürüst tahmin). Sonra aynı arama tüm veride koşulur ve `train` için `--param` önerisi basılır. Bkz. [Parametreler ve tuning](#parametreler-ve-tuning) |
 
-Model adları: `zero`, `mean`, `last`, `ma`, `ridge`, `gbm`.
+Model adları: `zero`, `mean`, `last`, `ma`, `ridge`, `gbm`; `ml` extra'sıyla
+`lgbm`, `lgbm_cls`, `ensemble`, `stack`; `deep` extra'sıyla `lstm`, `gru`
+(bkz. [Modeller](#modeller)).
 
 `predict --json` çıktısının anahtarları: `model`, `symbol`, `interval`, `horizon`,
 `as_of` (son kapanmış mumun `open_time`'ı), `target_time` (tahmin edilen
@@ -121,6 +141,14 @@ açmak için:
 ```bash
 cp .env.example .env
 docker compose up -d --build dashboard
+```
+
+İmaj varsayılan olarak `web,ml` extra'larıyla (LightGBM dahil) kurulur. LSTM/GRU
+için CPU PyTorch'lu (çok daha büyük) bir imaj:
+
+```bash
+docker build --build-arg EXTRAS=web,ml,deep -t cryptopredict:deep .
+# ya da .env'de: CRYPTOPREDICT_EXTRAS=web,ml,deep ve CRYPTOPREDICT_IMAGE=cryptopredict:deep
 ```
 
 Panel `http://127.0.0.1:8000` adresindedir. Portu ağdaki başka makinelere
@@ -290,11 +318,48 @@ sayılsaydı `h=1` hedefi aslında 2 barlık getiri olur, pencereler kesintinin
 | `ma` | `MovingAverageReturn` | Son `window` (24) eğitim hedefinin ortalaması; `column="ret_mean_24"` verilirse o kolon (CLI bunu kullanır) |
 | `ridge` | `RidgeForecaster` | StandardScaler + Ridge regresyon (`alpha=1.0`) |
 | `gbm` | `GBMForecaster` | HistGradientBoostingRegressor (deterministik, `random_state=42`) |
+| `lgbm` | `LGBMForecaster` | LightGBM regresyon; eğitim penceresinin son %15'iyle early stopping, sonra tüm pencereye refit (`ml`) |
+| `lgbm_cls` | `LGBMDirectionForecaster` | LightGBM yön sınıflandırıcı; olasılık, eğitimdeki koşullu ortalamalarla (`E[y\|up]`, `E[y\|down]`) getiriye çevrilir (`ml`) |
+| `ensemble` | `EnsembleForecaster` | Üyelerin (varsayılan `ridge`, `gbm`, `lgbm`) ağırlıklı ortalaması (`ml`) |
+| `stack` | `StackingForecaster` | Üye tahminleri üzerinde negatif olmayan Ridge meta-model; eğitim penceresindeki kronolojik out-of-fold tahminlerle eğitilir. CLI/panel `gap`'i horizon'a eşitler (`ml`) |
+| `lstm` | `LSTMForecaster` | PyTorch LSTM; son `lookback` (48) özellik satırından tahmin, zaman bütçeli CPU eğitimi (`deep`, **ağır**) |
+| `gru` | `GRUForecaster` | `lstm` ile aynı, GRU hücresi (`deep`, **ağır**) |
 
 Tüm modeller scikit-learn `BaseEstimator` tabanlıdır (`sklearn.base.clone`
 çalışır). Ölçekleme pipeline'ın içindedir, yani walk-forward'da yalnızca eğitim
 penceresine fit edilir. Model `models.get_model("ridge", alpha=10.0)` ile
-oluşturulur; `models.available_models()` kayıtlı adları döner.
+oluşturulur; `models.available_models()` kurulu bağımlılığı olan adları,
+`models.default_compare_models()` ise ağır (`heavy`) olmayanları döner.
+`backtest --model all` ve paneldeki `all` yalnız ağır olmayanları karşılaştırır;
+`lstm`/`gru` için `--include-heavy` (panelde `include_heavy: true`) gerekir.
+
+### Parametreler ve tuning
+
+`train`, `backtest` ve `tune` için `--param KEY=VALUE` tekrarlanabilir. Değer
+JSON olarak okunur (`50`, `0.05`, `true`, `null`, `["ridge","gbm"]`); Python
+yazımı `True`/`False`/`None` de olur, gerisi metindir. Bilinmeyen parametre,
+veri yüklenmeden hata verir. Eğitilen modelin parametreleri metadata'da
+`model_params` olarak saklanır.
+
+```bash
+cryptopredict train --csv $CSV --model ridge --param alpha=100 --out models/r.joblib
+cryptopredict backtest --csv $CSV --model lgbm --param num_leaves=7 --param min_child_samples=100
+cryptopredict train --csv $CSV --model stack --horizon 4 \
+    --param 'members=["ridge","gbm","lgbm"]' --out models/stack.joblib   # gap=4 otomatik
+cryptopredict tune --csv $CSV --model ridge --space 'alpha=[0.1,1,10,100]' --json
+```
+
+`tune` hiperparametreleri sızıntısız seçer: her dış walk-forward katında arama
+yalnız o katın eğitim satırlarında, iç walk-forward ile yapılır; dış test katına
+seçim sırasında hiç bakılmaz. Raporlanan "overall" metrikleri bu yüzden ayarlanmış
+modelin dürüst tahminidir. Ardından aynı arama tüm satırlarda koşulur ve
+`best_params` (bunun için skor iddiası yok) `train --param ...` önerisi olarak
+basılır. Arama uzayı `--space` ile verilmezse modelin yerleşik uzayı
+(`tuning.DEFAULT_SPACES`: `ridge`, `gbm`, `lgbm`, `lgbm_cls`) kullanılır; ilk aday
+her zaman varsayılanlardır. `--n-trials` arama başına aday sayısını,
+`--time-budget` arama başına saniye bütçesini sınırlar (bütçe dolunca çalışan aday
+biter, en iyisi döner). Dış/iç katlar arasında `gap = horizon` kullanılır;
+`stack` için de `gap = horizon` geçilir.
 
 ## Değerlendirme yöntemi
 
@@ -405,9 +470,10 @@ kapanmış BTCUSDT 1h mumu) ve sahte (mock) HTTP yanıtları kullanır.
 
 - Yalnızca fiyat/hacim tabanlı teknik özellikler; haber, on-chain, emir defteri
   veya duyarlılık verisi yok.
-- Klasik modeller (doğrusal ve ağaç tabanlı); derin öğrenme yok. Kısa vadeli
-  kripto getirileri gürültüye çok yakındır — modellerin `zero` baseline'ını
-  anlamlı biçimde yenememesi **beklenen** bir sonuçtur.
+- Derin modeller (`lstm`, `gru`) yalnız CPU'da ve zaman bütçesiyle eğitilir; büyük
+  ağlar ve GPU hedeflenmez. Kısa vadeli kripto getirileri gürültüye çok
+  yakındır — modellerin `zero` baseline'ını anlamlı biçimde yenememesi
+  **beklenen** bir sonuçtur.
 - Nokta tahmini üretilir; güven aralığı / olasılık dağılımı yok.
 - Backtest basitleştirilmiştir: kapanış fiyatından anında dolum, sabit
   komisyon/kayma, likidite, fonlama (funding) ve vergi yok; `h > 1` modelleri
@@ -430,13 +496,17 @@ kapanmış BTCUSDT 1h mumu) ve sahte (mock) HTTP yanıtları kullanır.
 (`target[t] = log(close[t+h] / close[t])`) from Binance OHLCV candles. It builds
 leakage-free technical features (`FeatureConfig`; computed per contiguous
 segment so neither features nor targets span missing candles), fits baselines (`zero`, `mean`,
-`last`, `ma`) and learned models (`ridge`, `gbm`), and evaluates them with
+`last`, `ma`) and learned models (`ridge`, `gbm`; with the `ml` extra `lgbm`,
+`lgbm_cls`, `ensemble`, `stack`; with the `deep` extra the heavy `lstm`, `gru`),
+and evaluates them with
 time-ordered **walk-forward validation** (fresh model per fold, `gap = horizon`)
 and a fee/slippage-aware long/flat(/short) **backtest** against buy-and-hold.
 Key metrics: MAE, RMSE, sMAPE, directional accuracy and `relative_mae`
 (< 1 beats the zero-return baseline); backtest Sharpe, max drawdown and costs.
 Install with `pip install -e ".[dev]"` (Python ≥ 3.11), use the `cryptopredict`
-CLI (`fetch`, `train`, `predict`, `backtest`; `--csv` for offline use,
+CLI (`fetch`, `train`, `predict`, `backtest`, `tune`; `--param KEY=VALUE` for
+model parameters, `backtest --model all --include-heavy` to also compare heavy
+models, `tune` for a nested walk-forward hyperparameter search; `--csv` for offline use,
 `CRYPTOPREDICT_BINANCE_URL` for a mirror if Binance returns HTTP 451), and run
 the offline test suite with `pytest`. **Not financial advice** — for education
 and research only.

@@ -108,6 +108,31 @@ def make_model(
     return get_model(name, **options)
 
 
+def resolve_model_params(
+    name: str,
+    params: dict[str, Any] | None = None,
+    *,
+    horizon: int = DEFAULT_HORIZON,
+) -> dict[str, Any]:
+    """``params`` plus the defaults that depend on the forecast horizon.
+
+    ``stack`` gets ``gap=horizon`` so that its inner out-of-fold forecasts are
+    never trained on targets overlapping the rows they predict.
+    """
+    options = dict(params or {})
+    if name == "stack":
+        options.setdefault("gap", horizon)
+    return options
+
+
+def check_model_params(name: str, params: dict[str, Any] | None = None) -> None:
+    """Raise ``ValueError`` now, not mid-job, if ``name`` rejects ``params``."""
+    try:
+        get_model(name, **dict(params or {}))
+    except TypeError as exc:
+        raise ValueError(f"invalid parameters for model {name!r}: {exc}") from None
+
+
 def _period(index: pd.Index) -> dict[str, str]:
     return {"start": index[0].isoformat(), "end": index[-1].isoformat()}
 
@@ -129,7 +154,7 @@ def train(
     X, y = make_dataset(df, horizon=horizon, config=cfg)
     if X.empty:
         raise ValueError("not enough history to build a training set")
-    params = dict(model_params or {})
+    params = resolve_model_params(model_name, model_params, horizon=horizon)
     model = make_model(model_name, list(X.columns), params=params)
     model.fit(X, y)
     info = {
@@ -277,8 +302,9 @@ def run_backtest(
     """
     X, y = dataset if dataset is not None else make_dataset(df, horizon=horizon, config=feature_config)
     columns = list(X.columns)
+    params = resolve_model_params(model_name, model_params, horizon=horizon)
     evaluation = walk_forward_evaluate(
-        lambda: make_model(model_name, columns, params=model_params),
+        lambda: make_model(model_name, columns, params=params),
         X,
         y,
         n_splits=n_splits,
