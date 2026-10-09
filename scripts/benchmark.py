@@ -9,10 +9,10 @@ dropping them, so a partial run remains auditable.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import importlib.metadata
 import json
-import math
 from pathlib import Path
 import platform
 import subprocess
@@ -27,15 +27,24 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
+from cryptopredict import pipeline
 from cryptopredict.evaluation import backtest, dm_vs_zero
 from cryptopredict.features import FeatureConfig, forward_log_return, make_dataset
 from cryptopredict.models import available_models
+from cryptopredict.models.ensemble import DEFAULT_MEMBERS
 from cryptopredict.pipeline import load_ohlcv, periods_per_year, run_backtest
 
 ALL_MODELS = [
     "zero", "mean", "last", "ma", "ridge", "gbm", "lgbm", "lgbm_cls",
     "ensemble", "stack", "lstm", "gru",
 ]
+DEEP_MODELS = {"lstm", "gru"}
+SEEDED_MODELS = {"gbm", "lgbm", "lgbm_cls", *DEEP_MODELS}
+# Holm family: every model except ``zero`` (its loss difference is identically 0)
+# run on the same symbol/interval/horizon/feature set, for one loss.
+HOLM_GROUP = ["symbol", "interval", "horizon", "feature_set", "loss"]
+HOLM_EXCLUDED = {"zero"}
+SLICE = ["symbol", "interval", "horizon"]
 LEGACY_PREFIXES = (
     "log_ret_", "ret_mean_", "close_sma_", "close_ema_", "rsi_", "macd",
     "bollinger_", "volatility_", "volume_zscore_",
@@ -46,8 +55,10 @@ RESULT_COLUMNS = [
     "test_start", "test_end", "n_obs", "mae", "rmse", "relative_mae",
     "directional_accuracy", "dm_mean_diff", "dm_stat", "dm_p_value",
     "dm_p_holm", "total_return", "sharpe", "max_drawdown", "n_trades",
-    "bh_total_return", "bh_sharpe", "bh_max_drawdown", "backtest_n_bars", "fee_bps",
-    "threshold", "seed", "max_train_seconds", "runtime_seconds", "status", "reason",
+    "bh_total_return", "bh_sharpe", "bh_max_drawdown", "excess_return", "exposure",
+    "total_cost", "backtest_n_bars", "fee_bps", "threshold", "seed",
+    "max_train_seconds", "deep_epochs", "deep_time_stops", "runtime_seconds",
+    "status", "reason",
 ]
 
 
@@ -72,10 +83,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("data/benchmark/results.csv"))
     parser.add_argument("--splits", type=int, default=5)
     parser.add_argument("--fee-bps", type=float, default=10.0)
-    parser.add_argument("--threshold-bps", nargs="+", type=float, default=[0.0, 2.5, 5.0, 10.0])
+    parser.add_argument(
+        "--threshold-bps", nargs="+", type=float, default=[0.0, 2.5, 5.0, 10.0],
+        help="signal thresholds re-applied to the OOS forecasts of every successful model",
+    )
+    parser.add_argument(
+        "--threshold-focus", nargs="+", default=["ridge", "lgbm"],
+        help="models fixed in advance for the per-slice threshold table (no test-set selection)",
+    )
     parser.add_argument("--loss", choices=["absolute", "squared"], default="absolute")
     parser.add_argument("--hac-kernel", choices=["bartlett", "uniform"], default="bartlett")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42, help="random_state of every stochastic model")
     parser.add_argument("--deep-max-train-seconds", type=float, default=60.0)
     parser.add_argument("--deep-max-epochs", type=int, default=100)
     parser.add_argument(
@@ -129,15 +147,49 @@ def _legacy_dataset(df: pd.DataFrame, horizon: int, config: FeatureConfig):
 
 
 def _model_params(name: str, args: argparse.Namespace) -> dict[str, Any] | None:
-    if name in {"lstm", "gru"}:
+    if name in DEEP_MODELS:
         return {
             "random_state": args.seed,
             "max_train_seconds": args.deep_max_train_seconds,
             "max_epochs": args.deep_max_epochs,
         }
-    if name in {"gbm", "lgbm", "lgbm_cls"}:
+    if name in SEEDED_MODELS:
         return {"random_state": args.seed}
+    if name in {"ensemble", "stack"}:
+        members = tuple(
+            (member, {"random_state": args.seed}) if member in SEEDED_MODELS else member
+            for member in DEFAULT_MEMBERS
+        )
+        return {"members": members}
     return None
+
+
+@contextmanager
+def _recording_models():
+    """Collect the per-fold models ``run_backtest`` builds, to read their fit attributes."""
+    built: list[Any] = []
+    original = pipeline.make_model
+
+    def make_and_record(*args: Any, **kwargs: Any):
+        model = original(*args, **kwargs)
+        built.append(model)
+        return model
+
+    pipeline.make_model = make_and_record
+    try:
+        yield built
+    finally:
+        pipeline.make_model = original
+
+
+def _deep_budget(models: list[Any]) -> dict[str, Any]:
+    """Epochs per fold and how many folds hit the wall-clock limit (hardware dependent)."""
+    if not models or not all(hasattr(model, "n_epochs_") for model in models):
+        return {}
+    return {
+        "deep_epochs": ";".join(str(int(model.n_epochs_)) for model in models),
+        "deep_time_stops": sum(bool(getattr(model, "stopped_by_time_", False)) for model in models),
+    }
 
 
 def _empty_row(context: dict[str, Any], model: str, args: argparse.Namespace) -> dict[str, Any]:
@@ -150,7 +202,7 @@ def _empty_row(context: dict[str, Any], model: str, args: argparse.Namespace) ->
         "fee_bps": args.fee_bps,
         "threshold": 0.0,
         "seed": args.seed,
-        "max_train_seconds": args.deep_max_train_seconds if model in {"lstm", "gru"} else None,
+        "max_train_seconds": args.deep_max_train_seconds if model in DEEP_MODELS else None,
     })
     return row
 
@@ -160,14 +212,13 @@ def _evaluate(
     model: str,
     horizon: int,
     interval: str,
-    feature_set: str,
     dataset,
     context: dict[str, Any],
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], Any | None]:
     row = _empty_row(context, model, args)
     deep_case = f"{context['symbol']}:{interval}:{horizon}"
-    if model in {"lstm", "gru"} and deep_case not in args.deep_cases:
+    if model in DEEP_MODELS and deep_case not in args.deep_cases:
         row.update(status="skipped", reason=f"deep time budget excludes {deep_case}")
         return row, None
     if model not in available_models():
@@ -175,11 +226,13 @@ def _evaluate(
         return row, None
     started = time.monotonic()
     try:
-        report = run_backtest(
-            df, model, horizon=horizon, n_splits=args.splits, fee_bps=args.fee_bps,
-            interval=interval, feature_config=FeatureConfig(), dataset=dataset,
-            model_params=_model_params(model, args),
-        )
+        with _recording_models() as fold_models:
+            report = run_backtest(
+                df, model, horizon=horizon, n_splits=args.splits, fee_bps=args.fee_bps,
+                interval=interval, feature_config=FeatureConfig(), dataset=dataset,
+                model_params=_model_params(model, args),
+            )
+        row.update(_deep_budget(fold_models))
         predictions = report.evaluation.predictions
         dm = dm_vs_zero(
             predictions["y_true"], predictions["y_pred"], horizon=horizon,
@@ -250,6 +303,123 @@ def _markdown_table(frame: pd.DataFrame, columns: list[str]) -> str:
     return "\n".join([header, rule, *body])
 
 
+def _summary_tables(
+    results: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    args: argparse.Namespace,
+) -> list[tuple[str, str, pd.DataFrame]]:
+    """``(title, description, table)`` sections that ``docs/results.md`` quotes."""
+    ok = results[results["status"] == "ok"].copy()
+    ok["holm_better"] = (ok["dm_stat"] < 0) & (ok["dm_p_holm"] < 0.05)
+    ok["holm_worse"] = (ok["dm_stat"] > 0) & (ok["dm_p_holm"] < 0.05)
+    ok["raw_better"] = (ok["dm_stat"] < 0) & (ok["dm_p_value"] < 0.05)
+    rich = ok[ok["feature_set"] == "rich"]
+    learned = rich[~rich["model"].isin(HOLM_EXCLUDED)]
+    sections: list[tuple[str, str, pd.DataFrame]] = []
+
+    best = (
+        learned.sort_values([*SLICE, "mae"], kind="stable").groupby(SLICE, sort=False).head(1)
+    )
+    sections.append((
+        "Lowest-MAE non-zero model per slice (rich features)",
+        "Descriptive only: picking the minimum over models is itself a selection; see dm_p_holm.",
+        best[[*SLICE, "model", "mae", "rmse", "relative_mae", "directional_accuracy",
+              "dm_stat", "dm_p_value", "dm_p_holm", "total_return", "bh_total_return",
+              "n_trades"]],
+    ))
+
+    family = ok[~ok["model"].isin(HOLM_EXCLUDED)]
+    if not family.empty:
+        significance = family.groupby([*SLICE, "feature_set"], sort=False).agg(
+            models=("model", "size"),
+            raw_better=("raw_better", "sum"),
+            holm_better=("holm_better", "sum"),
+            holm_worse=("holm_worse", "sum"),
+            min_p_better=("dm_p_value", lambda p: p[family.loc[p.index, "dm_stat"] < 0].min()),
+        ).reset_index()
+        sections.append((
+            "DM test against zero per Holm family",
+            "better/worse = DM statistic sign with p < 0.05; min_p_better is the smallest raw p "
+            "among models with a negative statistic.",
+            significance,
+        ))
+
+    if not learned.empty:
+        by_model = learned.groupby("model", sort=False).agg(
+            conditions=("relative_mae", "size"),
+            mean_relative_mae=("relative_mae", "mean"),
+            best_relative_mae=("relative_mae", "min"),
+            below_one=("relative_mae", lambda values: int((values < 1).sum())),
+            holm_better=("holm_better", "sum"),
+            holm_worse=("holm_worse", "sum"),
+            median_total_return=("total_return", "median"),
+        ).reset_index().sort_values("mean_relative_mae", kind="stable")
+        sections.append(("Model summary over rich-feature slices", "", by_model))
+
+    legacy = ok[ok["feature_set"] == "legacy"]
+    if not legacy.empty:
+        pairs = rich.merge(legacy, on=[*SLICE, "model"], suffixes=("_rich", "_legacy"))
+        pairs["rich_better"] = pairs["relative_mae_rich"] < pairs["relative_mae_legacy"]
+        pairs["difference"] = pairs["relative_mae_rich"] - pairs["relative_mae_legacy"]
+        ablation = pairs.groupby("model", sort=False).agg(
+            conditions=("difference", "size"),
+            rich_better=("rich_better", "sum"),
+            legacy_mean=("relative_mae_legacy", "mean"),
+            rich_mean=("relative_mae_rich", "mean"),
+            mean_difference=("difference", "mean"),
+        ).reset_index()
+        sections.append((
+            "Rich vs legacy features (relative MAE)",
+            "Positive mean_difference means the rich set is worse.",
+            ablation,
+        ))
+
+    if not thresholds.empty:
+        rich_thresholds = thresholds[thresholds["feature_set"] == "rich"].copy()
+        rich_thresholds["beats_bh"] = rich_thresholds["total_return"] > rich_thresholds["bh_total_return"]
+        rich_thresholds["positive"] = rich_thresholds["total_return"] > 0
+        aggregate = rich_thresholds.groupby("threshold_bps").agg(
+            model_slices=("total_return", "size"),
+            median_total_return=("total_return", "median"),
+            positive=("positive", "sum"),
+            beats_bh=("beats_bh", "sum"),
+            median_n_trades=("n_trades", "median"),
+        ).reset_index()
+        sections.append((
+            "Threshold sensitivity over every successful non-zero model (rich features)",
+            "Thresholds are applied after the fact to the same OOS forecasts; nothing is selected "
+            "on the test period, so these are not achievable returns of a tuned rule.",
+            aggregate,
+        ))
+        focus = rich_thresholds[rich_thresholds["model"].isin(args.threshold_focus)]
+        if not focus.empty:
+            wide = focus.pivot_table(
+                index=[*SLICE, "model"], columns="threshold_bps",
+                values=["total_return", "n_trades"], sort=False,
+            )
+            wide.columns = [
+                f"{'ret' if name == 'total_return' else 'trades'}_{bps:g}bps" for name, bps in wide.columns
+            ]
+            bh = focus.groupby([*SLICE, "model"], sort=False)["bh_total_return"].first()
+            wide = wide.join(bh).reset_index()
+            sections.append((
+                f"Threshold sensitivity for models fixed in advance ({', '.join(args.threshold_focus)})",
+                "", wide,
+            ))
+
+    deep = ok[ok["model"].isin(DEEP_MODELS)]
+    if not deep.empty:
+        sections.append((
+            "Time-budgeted LSTM/GRU",
+            f"At most {args.deep_max_train_seconds:g} s and {args.deep_max_epochs} epochs per fold; "
+            "deep_epochs lists the epochs reached per fold, deep_time_stops the folds stopped by the clock.",
+            deep[[*SLICE, "feature_set", "model", "relative_mae", "directional_accuracy", "dm_stat",
+                  "dm_p_value", "dm_p_holm", "total_return", "n_trades", "deep_epochs",
+                  "deep_time_stops", "runtime_seconds"]],
+        ))
+    return sections
+
+
 def _write_outputs(
     results: pd.DataFrame,
     thresholds: pd.DataFrame,
@@ -271,11 +441,18 @@ def _write_outputs(
         "mae", "relative_mae", "directional_accuracy", "dm_stat", "dm_p_value",
         "dm_p_holm", "total_return", "sharpe", "max_drawdown", "n_trades",
     ]
-    markdown_path.write_text(
-        "# Generated benchmark table\n\n"
-        f"Run `{metadata['run_id']}`, commit `{metadata['commit_sha']}`.\n\n"
-        + _markdown_table(ok, columns) + "\n"
-    )
+    parts = [
+        "# Generated benchmark tables\n",
+        f"Run `{metadata['run_id']}`, commit `{metadata['commit_sha']}`.\n",
+    ]
+    for title, description, table in _summary_tables(results, thresholds, args):
+        parts.append(f"## {title}\n")
+        if description:
+            parts.append(description + "\n")
+        parts.append(_markdown_table(table, list(table.columns)) + "\n")
+    parts.append("## All successful rows\n")
+    parts.append(_markdown_table(ok, columns) + "\n")
+    markdown_path.write_text("\n".join(parts))
     print(f"wrote {args.output}, {threshold_path}, {metadata_path}, {markdown_path}")
 
 
@@ -305,6 +482,9 @@ def main(argv: list[str] | None = None) -> int:
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "versions": _versions(),
         "note": "No hyperparameter tuning; fixed defaults avoid test-set selection.",
+        "holm_family": f"{HOLM_GROUP}, excluding {sorted(HOLM_EXCLUDED)}",
+        "thresholds": "every successful non-zero model, applied post hoc; no selection",
+        "deep_budget": "wall-clock stopping depends on hardware; see deep_epochs/deep_time_stops",
     }
     rows: list[dict[str, Any]] = []
     threshold_rows: list[dict[str, Any]] = []
@@ -320,11 +500,14 @@ def main(argv: list[str] | None = None) -> int:
             horizons = args.horizons or ([1, 4, 24] if interval == "1h" else [1])
             for horizon in horizons:
                 config = FeatureConfig()
-                rich_dataset = make_dataset(df, horizon=horizon, config=config)
-                legacy_dataset = _legacy_dataset(df, horizon, config)
-                feature_cases = [("rich", rich_dataset)]
+                feature_cases: list[tuple[str, Any]] = [
+                    ("rich", make_dataset(df, horizon=horizon, config=config)),
+                ]
                 if not args.no_ablation:
-                    feature_cases.append(("legacy", legacy_dataset))
+                    try:
+                        feature_cases.append(("legacy", _legacy_dataset(df, horizon, config)))
+                    except Exception as exc:  # recorded per model below
+                        feature_cases.append(("legacy", exc))
                 for feature_set, dataset in feature_cases:
                     models = args.models if feature_set == "rich" else [
                         model for model in args.models if model in args.ablation_models
@@ -340,30 +523,26 @@ def main(argv: list[str] | None = None) -> int:
                         "data_end": df.index[-1].isoformat(),
                         "n_bars": len(df),
                     }
-                    reports: list[tuple[dict[str, Any], Any | None]] = []
                     for model in models:
                         print(f"  {interval} h={horizon} {feature_set} {model}", flush=True)
-                        row, report = _evaluate(
-                            df, model, horizon, interval, feature_set, dataset,
-                            context, args,
-                        )
+                        if isinstance(dataset, Exception):
+                            row = _empty_row(context, model, args)
+                            row.update(status="error", reason=f"{type(dataset).__name__}: {dataset}")
+                            rows.append(row)
+                            continue
+                        row, report = _evaluate(df, model, horizon, interval, dataset, context, args)
                         rows.append(row)
-                        reports.append((row, report))
-
-                    successful = [(row, report) for row, report in reports if report is not None]
-                    successful.sort(key=lambda item: item[0].get("mae", math.inf))
-                    # Sensitivity for the best non-zero model; descriptive only, never used for selection.
-                    best = next(((row, report) for row, report in successful if row["model"] != "zero"), None)
-                    if best is not None:
-                        threshold_context = {**context, "frame": df}
-                        threshold_rows.extend(
-                            _threshold_rows(best[1], threshold_context, best[0]["model"], interval, args)
-                        )
+                        if report is not None and model not in HOLM_EXCLUDED:
+                            threshold_rows.extend(
+                                _threshold_rows(report, {**context, "frame": df}, model, interval, args)
+                            )
 
     results = pd.DataFrame(rows, columns=RESULT_COLUMNS)
-    ok = results["status"] == "ok"
-    group = ["symbol", "interval", "horizon", "feature_set", "loss"]
-    results.loc[ok, "dm_p_holm"] = results.loc[ok].groupby(group, dropna=False)["dm_p_value"].transform(_holm)
+    family = (results["status"] == "ok") & ~results["model"].isin(HOLM_EXCLUDED)
+    results["dm_p_holm"] = np.nan
+    results.loc[family, "dm_p_holm"] = (
+        results.loc[family].groupby(HOLM_GROUP, dropna=False)["dm_p_value"].transform(_holm)
+    )
     thresholds = pd.DataFrame(threshold_rows)
     _write_outputs(results, thresholds, args, metadata)
     errors = int((results["status"] == "error").sum())
