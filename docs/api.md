@@ -11,7 +11,7 @@ responses are JSON. When `CRYPTOPREDICT_DASHBOARD_TOKEN` is set, every
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/health` | Service status and package version |
-| `GET` | `/api/config` | Models, intervals, defaults, paths, and auth status |
+| `GET` | `/api/config` | Models (`models`, and the slow subset `heavy_models`), intervals, defaults, paths, and auth status |
 | `GET` | `/api/datasets` | Cached `<SYMBOL>_<interval>.csv` datasets |
 | `GET` | `/api/ohlcv?symbol=BTCUSDT&interval=1h&limit=500` | Latest cached candles |
 | `GET` | `/api/models` | Saved model metadata |
@@ -22,10 +22,29 @@ responses are JSON. When `CRYPTOPREDICT_DASHBOARD_TOKEN` is set, every
 
 `POST /api/fetch` accepts `symbol`, `interval`, `start`, and optional `end`.
 `POST /api/train` accepts `symbol`, `interval`, optional `start`, `model`,
-`horizon`, and optional artifact `name`. `POST /api/backtest` accepts the same
-data/model fields plus `splits`, costs, thresholds, and `allow_short`; use model
-`all` for a comparison table. These operations return HTTP 202 with a
-`job_id`. Poll `/api/jobs/{id}` until its status is `done` or `failed`.
+`horizon`, optional artifact `name`, and optional model `params`. `POST
+/api/backtest` accepts the same data/model fields plus `splits`, costs,
+thresholds, `allow_short`, and `include_heavy`; use model `all` for a comparison
+table. These operations return HTTP 202 with a `job_id`. Poll `/api/jobs/{id}`
+until its status is `done` or `failed`.
+
+Model parameters are a JSON object passed to the model constructor; they are
+checked before the job is queued (unknown names give HTTP 400) and are not
+allowed with model `all`. A trained artifact keeps them as `model_params`, also
+listed by `/api/models`; a single-model backtest result returns them next to
+`summary`. For `stack`, `gap` defaults to `horizon`.
+
+```json
+POST /api/train
+{"symbol": "BTCUSDT", "interval": "1h", "model": "lgbm", "horizon": 1,
+ "params": {"n_estimators": 300, "learning_rate": 0.03}}
+```
+
+Model `all` compares only the models that are not heavy (`heavy_models` in
+`/api/config`, e.g. `lstm`, `gru`); set `"include_heavy": true` to add them.
+Models whose optional dependencies are missing from the image are not listed
+at all; the image's `EXTRAS` build argument (default `web,ml`, add `deep` for
+`lstm`/`gru`) is described in the README's "Dashboard & Docker" section.
 
 `POST /api/predict` is synchronous and accepts a saved artifact `name` plus an
 optional `refresh` flag. `DELETE /api/models/{name}` deletes an artifact and

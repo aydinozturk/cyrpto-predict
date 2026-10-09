@@ -8,8 +8,16 @@ COPY pyproject.toml README.md ./
 COPY cryptopredict ./cryptopredict
 RUN python -m build --wheel --outdir /dist
 
-# ---- runtime: install the wheel with the web extra, run as non-root ----
+# ---- runtime: install the wheel with its extras, run as non-root ----
 FROM python:3.11-slim AS runtime
+# Optional dependency groups from pyproject.toml. The default image has the
+# dashboard and LightGBM; add `deep` for the LSTM/GRU models (CPU-only PyTorch,
+# a much larger image):
+#   docker build --build-arg EXTRAS=web,ml,deep -t cryptopredict:deep .
+ARG EXTRAS=web,ml
+# Comma-separated, no spaces. torch is installed from TORCH_INDEX_URL first when
+# EXTRAS contains `deep` (CPU wheels, no CUDA).
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -19,11 +27,20 @@ ENV PYTHONUNBUFFERED=1 \
     CRYPTOPREDICT_HOST=0.0.0.0 \
     CRYPTOPREDICT_PORT=8000
 
+# LightGBM (`ml`) and PyTorch need the OpenMP runtime
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /dist /tmp/dist
 # dependency ranges come from pyproject.toml via the wheel
 # hadolint ignore=DL3013
 RUN WHEEL="$(ls /tmp/dist/*.whl)" \
-    && pip install "${WHEEL}[web]" \
+    && case ",${EXTRAS}," in \
+         *,deep,*) pip install torch --index-url "${TORCH_INDEX_URL}" ;; \
+       esac \
+    && pip install "${WHEEL}${EXTRAS:+[${EXTRAS}]}" \
     && rm -rf /tmp/dist \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /app --no-create-home app \

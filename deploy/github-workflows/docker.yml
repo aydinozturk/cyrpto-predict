@@ -68,6 +68,9 @@ jobs:
         with:
           context: .
           platforms: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+          # Dockerfile EXTRAS; the repository variable DOCKER_EXTRAS can add `deep`
+          build-args: |
+            EXTRAS=${{ vars.DOCKER_EXTRAS || 'web,ml' }}
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -171,6 +174,9 @@ jobs:
         with:
           context: .
           platforms: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+          # Dockerfile EXTRAS; the repository variable DOCKER_EXTRAS can add `deep`
+          build-args: |
+            EXTRAS=${{ vars.DOCKER_EXTRAS || 'web,ml' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

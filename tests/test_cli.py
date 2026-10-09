@@ -10,8 +10,8 @@ import pytest
 
 from cryptopredict import cli, data, pipeline
 from cryptopredict.evaluation import directional_accuracy
-from cryptopredict.features import forward_log_return, make_dataset
-from cryptopredict.models import default_compare_models, load_model
+from cryptopredict.features import FeatureConfig, forward_log_return, make_dataset, required_history
+from cryptopredict.models import ZeroReturn, default_compare_models, load_model, registry
 
 from .conftest import SAMPLE_CSV, load_sample_ohlcv
 
@@ -36,7 +36,7 @@ def test_help_runs_as_module():
     out = subprocess.run(
         [sys.executable, "-m", "cryptopredict.cli", "--help"], capture_output=True, text=True, check=True
     ).stdout
-    for command in ("fetch", "train", "predict", "backtest"):
+    for command in ("fetch", "train", "predict", "backtest", "tune"):
         assert command in out
 
 
@@ -301,3 +301,124 @@ def test_cli_predict_skips_open_bar_in_csv(tmp_path, capsys):
     captured = capsys.readouterr()
     assert json.loads(captured.out)["as_of"] == df.index[-1].isoformat()
     assert captured.err == ""
+
+
+class SlowZero(ZeroReturn):
+    """Stand-in for a heavy sequence model."""
+
+    name = "slow_zero"
+    heavy = True
+    lookback = 600
+
+
+@pytest.fixture
+def heavy_model(monkeypatch):
+    monkeypatch.setitem(registry.LAZY_MODELS, "slow_zero", f"{__name__}:SlowZero")
+    return "slow_zero"
+
+
+def test_parse_params_values():
+    params = cli._parse_params(
+        ["n=50", "lr=0.05", "flag=true", "py=False", "none=None", "xs=[1, 2]", "obj=l2", "empty=", " k = 3 "]
+    )
+    assert params == {
+        "n": 50, "lr": 0.05, "flag": True, "py": False, "none": None,
+        "xs": [1, 2], "obj": "l2", "empty": "", "k": 3,
+    }
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        cli._parse_params(["novalue"])
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        cli._parse_params(["bad-key=1"])
+
+
+def test_train_writes_params_to_metadata(tmp_path, capsys):
+    pytest.importorskip("lightgbm")
+    out = tmp_path / "lgbm.joblib"
+    result = run_json(
+        capsys, "train", "--csv", str(SAMPLE_CSV), "--model", "lgbm",
+        "--param", "n_estimators=50", "--param", "learning_rate=0.05", "--out", str(out),
+    )
+    assert result["model_params"] == {"n_estimators": 50, "learning_rate": 0.05}
+    model, metadata = load_model(out)
+    assert metadata["model_params"] == {"n_estimators": 50, "learning_rate": 0.05}
+    assert model.n_estimators == 50 and model.learning_rate == 0.05
+
+
+def test_stack_gets_gap_equal_to_horizon(tmp_path, capsys):
+    out = tmp_path / "stack.joblib"
+    result = run_json(
+        capsys, "train", "--csv", str(SAMPLE_CSV), "--model", "stack", "--horizon", "4",
+        "--param", 'members=["zero","ridge"]', "--out", str(out),
+    )
+    assert result["model_params"] == {"members": ["zero", "ridge"], "gap": 4}
+    model, _ = load_model(out)
+    assert model.gap == 4
+    assert pipeline.resolve_model_params("stack", {"gap": 0}, horizon=3) == {"gap": 0}
+    assert pipeline.resolve_model_params("ridge", None, horizon=3) == {}
+
+
+def test_invalid_params_fail_before_loading_data(capsys):
+    assert cli.main(["train", "--csv", "missing.csv", "--model", "ridge", "--param", "bogus=1", "--out", "x.joblib"]) == 1
+    assert "invalid parameters for model 'ridge'" in capsys.readouterr().err
+    assert cli.main(["backtest", "--csv", str(SAMPLE_CSV), "--model", "all", "--param", "alpha=1"]) == 1
+    assert "--param needs a single --model" in capsys.readouterr().err
+
+
+def test_backtest_single_model_with_params(capsys):
+    result = run_json(capsys, "backtest", "--csv", str(SAMPLE_CSV), "--model", "ridge", "--splits", "3", "--param", "alpha=1000")
+    assert result["model_params"] == {"alpha": 1000}
+    default = run_json(capsys, "backtest", "--csv", str(SAMPLE_CSV), "--model", "ridge", "--splits", "3")
+    assert result["overall"]["mae"] != pytest.approx(default["overall"]["mae"])
+
+
+def test_backtest_all_skips_heavy_unless_included(heavy_model, capsys):
+    result = run_json(capsys, "backtest", "--csv", str(SAMPLE_CSV), "--model", "all", "--splits", "2")
+    names = {row["model"] for row in result["models"]}
+    assert heavy_model not in names and "zero" in names and result["include_heavy"] is False
+    result = run_json(
+        capsys, "backtest", "--csv", str(SAMPLE_CSV), "--model", "all", "--splits", "2", "--include-heavy"
+    )
+    assert heavy_model in {row["model"] for row in result["models"]}
+
+
+def test_predict_history_covers_warmup_and_lookback(heavy_model):
+    metadata = {"feature_config": FeatureConfig().to_dict()}
+    warmup = required_history(FeatureConfig(), timedelta(hours=1))
+    assert cli.predict_history_bars(ZeroReturn(), metadata, "1h") == max(cli.PREDICT_LOOKBACK_BARS, warmup + cli.PREDICT_MARGIN_BARS)
+    expected = warmup + SlowZero.lookback - 1 + cli.PREDICT_MARGIN_BARS
+    assert expected > cli.PREDICT_LOOKBACK_BARS
+    assert cli.predict_history_bars(SlowZero(), metadata, "1h") == expected
+
+
+def test_tune_runs_nested_search_on_fixture(capsys):
+    result = run_json(
+        capsys, "tune", "--csv", str(SAMPLE_CSV), "--model", "ridge", "--splits", "2", "--inner-splits", "2",
+        "--n-trials", "3", "--space", "alpha=[0.1,10,1000]",
+    )
+    assert len(result["folds"]) == 2
+    assert all(fold["n_trials"] == 3 for fold in result["folds"])
+    assert all(set(fold["params"]) <= {"alpha"} for fold in result["folds"])
+    assert result["best_params"].get("alpha", 1.0) in {0.1, 10, 1000, 1.0}
+    assert result["final_trials"] == 3 and result["timed_out"] is False
+    assert {"mae", "rmse", "directional_accuracy"} <= set(result["overall"])
+    assert result["space"] == {"alpha": [0.1, 10, 1000]}
+
+    assert cli.main(["tune", "--csv", str(SAMPLE_CSV), "--model", "ridge", "--splits", "2", "--n-trials", "3"]) == 0
+    text = capsys.readouterr().out
+    assert "nested walk-forward" in text and "train with: cryptopredict train --model ridge" in text
+
+
+def test_tune_time_budget_and_stack_gap(capsys):
+    result = run_json(
+        capsys, "tune", "--csv", str(SAMPLE_CSV), "--model", "stack", "--horizon", "2", "--splits", "2",
+        "--inner-splits", "2", "--n-trials", "3", "--time-budget", "0",
+        "--param", 'members=["zero","ridge"]', "--space", "alpha=[0.1,10]",
+    )
+    assert result["timed_out"] is True and result["final_trials"] == 1
+    assert result["base_params"] == {"members": ["zero", "ridge"], "gap": 2}
+    assert result["best_params"] == {"members": ["zero", "ridge"], "gap": 2}
+
+
+def test_tune_rejects_bad_space(capsys):
+    assert cli.main(["tune", "--csv", str(SAMPLE_CSV), "--model", "ridge", "--space", "alpha=1"]) == 1
+    assert "non-empty JSON list" in capsys.readouterr().err

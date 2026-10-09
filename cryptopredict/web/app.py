@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from cryptopredict import __version__, data, pipeline
-from cryptopredict.models import available_models, load_model
+from cryptopredict.models import available_models, default_compare_models, load_model
 from cryptopredict.web.jobs import JobRunner, json_safe
 from cryptopredict.web.settings import SUPPORTED_INTERVALS, Settings
 
@@ -39,6 +39,7 @@ class TrainRequest(BaseModel):
     model: str
     horizon: int = Field(default=1, ge=1)
     name: str | None = None
+    params: dict[str, Any] | None = None
 
 
 class PredictRequest(BaseModel):
@@ -58,6 +59,8 @@ class BacktestRequest(BaseModel):
     threshold: float = Field(default=0.0, ge=0)
     da_threshold: float = Field(default=0.0, ge=0)
     allow_short: bool = False
+    params: dict[str, Any] | None = None
+    include_heavy: bool = False
 
 
 def _symbol(value: str) -> str:
@@ -88,6 +91,23 @@ def _registered_model(value: str, *, allow_all: bool = False) -> str:
     if value not in choices:
         raise HTTPException(status_code=400, detail=f"unknown model {value!r}; available: {', '.join(choices)}")
     return value
+
+
+def _heavy_models() -> list[str]:
+    quick = set(default_compare_models())
+    return [name for name in available_models() if name not in quick]
+
+
+def _checked_params(model_name: str, params: dict[str, Any] | None) -> dict[str, Any]:
+    if not params:
+        return {}
+    if model_name == "all":
+        raise HTTPException(status_code=400, detail="params need a single model, not 'all'")
+    try:
+        pipeline.check_model_params(model_name, params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return dict(params)
 
 
 def _cache_path(settings: Settings, symbol: str, interval: str) -> Path:
@@ -124,6 +144,7 @@ def _model_payload(name: str, metadata: dict[str, Any]) -> dict[str, Any]:
         "horizon": metadata.get("horizon"),
         "train_period": metadata.get("train_period"),
         "n_samples": metadata.get("n_samples"),
+        "model_params": metadata.get("model_params") or {},
         "created_at": metadata.get("saved_at"),
     }
 
@@ -194,6 +215,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "version": __version__,
             "models": available_models(),
+            # slow models: left out of model "all" unless include_heavy is set
+            "heavy_models": _heavy_models(),
             "intervals": SUPPORTED_INTERVALS,
             "default_symbol": settings.default_symbol,
             "default_interval": settings.default_interval,
@@ -258,6 +281,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         symbol = _symbol(request.symbol)
         interval = _interval(request.interval)
         model_name = _registered_model(request.model)
+        model_params = _checked_params(model_name, request.params)
         artifact_name = _model_name(
             request.name if request.name is not None else f"{symbol}_{interval}_{model_name}_h{request.horizon}"
         )
@@ -268,7 +292,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         def operation() -> dict[str, Any]:
             frame = _frame_for_job(settings, symbol, interval, request.start)
-            model, info = pipeline.train(frame, model_name, horizon=request.horizon)
+            model, info = pipeline.train(frame, model_name, horizon=request.horizon, model_params=model_params)
             path = _artifact_path(settings, artifact_name)
             metadata = pipeline.save_trained(
                 model,
@@ -329,6 +353,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         symbol = _symbol(request.symbol)
         interval = _interval(request.interval)
         model_name = _registered_model(request.model, allow_all=True)
+        model_params = _checked_params(model_name, request.params)
         if request.start is None and not _cache_path(settings, symbol, interval).is_file():
             raise HTTPException(status_code=400, detail=f"dataset not found for {symbol} {interval}; provide start")
         params = request.model_dump()
@@ -347,10 +372,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 interval=interval,
             )
             if model_name == "all":
-                table, _ = pipeline.compare_models(frame, **options)
+                names = available_models() if request.include_heavy else default_compare_models()
+                table, _ = pipeline.compare_models(frame, names, **options)
                 return {"table": table.reset_index().to_dict(orient="records")}
-            report = pipeline.run_backtest(frame, model_name, **options)
-            return {"summary": report.summary()}
+            report = pipeline.run_backtest(frame, model_name, model_params=model_params, **options)
+            resolved = pipeline.resolve_model_params(model_name, model_params, horizon=request.horizon)
+            return {"summary": report.summary(), "model_params": resolved}
 
         return {"job_id": runner.submit("backtest", params, operation)}
 
